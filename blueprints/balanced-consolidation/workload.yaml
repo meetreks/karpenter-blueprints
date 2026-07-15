@@ -1,0 +1,93 @@
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: karpenter-blueprint-low
+value: 100
+globalDefault: false
+description: "Low priority for the Balanced consolidation blueprint demo."
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: karpenter-blueprint-high
+value: 1000
+globalDefault: false
+description: "High priority for the Balanced consolidation blueprint demo. Balanced weights disruption of high-priority pods more heavily, making their host less consolidation-worthy."
+---
+# Baseline inflate deployment used in Scenarios A and B.
+# Starts at 0 replicas so you can drive it up/down interactively.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inflate
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: inflate
+  template:
+    metadata:
+      labels:
+        app: inflate
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: inflate
+          image: public.ecr.aws/eks-distro/kubernetes/pause:3.7
+          resources:
+            requests:
+              cpu: "1"
+              memory: "1Gi"
+---
+# Low-priority variant for Scenario C (priority-weighted disruption).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inflate-lowpri
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: inflate-lowpri
+  template:
+    metadata:
+      labels:
+        app: inflate-lowpri
+    spec:
+      priorityClassName: karpenter-blueprint-low
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: inflate
+          image: public.ecr.aws/eks-distro/kubernetes/pause:3.7
+          resources:
+            requests:
+              cpu: "1"
+              memory: "1Gi"
+---
+# High-priority variant for Scenario C.
+# Balanced counts these as more disruptive to move, so their host node
+# is less likely to be picked for single-node consolidation.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inflate-highpri
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: inflate-highpri
+  template:
+    metadata:
+      labels:
+        app: inflate-highpri
+    spec:
+      priorityClassName: karpenter-blueprint-high
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: inflate
+          image: public.ecr.aws/eks-distro/kubernetes/pause:3.7
+          resources:
+            requests:
+              cpu: "1"
+              memory: "1Gi"

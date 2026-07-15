@@ -1,0 +1,35 @@
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: default
+spec:
+  template:
+    spec:
+      # EKS Auto Mode uses its own NodeClass (group eks.amazonaws.com) rather
+      # than EC2NodeClass. See the migration guide:
+      # https://docs.aws.amazon.com/eks/latest/userguide/auto-migrate-karpenter.html
+      nodeClassRef:
+        group: eks.amazonaws.com
+        kind: NodeClass
+        name: default
+      requirements:
+        - key: eks.amazonaws.com/instance-category
+          operator: In
+          values: ["c", "m", "r"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+      expireAfter: 720h
+  limits:
+    cpu: "100"
+    memory: 400Gi
+  disruption:
+    # See the self-managed variant (balanced-consolidation.yaml) for
+    # the full behavioral note on Balanced.
+    consolidationPolicy: Balanced
+    consolidateAfter: 30s
+    budgets:
+      - nodes: "10%"
