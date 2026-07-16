@@ -1,0 +1,51 @@
+---
+# Demo pod that verifies nested virtualization is exposed on the node.
+# Requires privileged: true to access /dev/kvm — this is intentional for the
+# demonstration. Real nested-virt workloads (Kata Containers, KVM CI runners)
+# would use a proper RuntimeClass + KVM device plugin instead.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nested-virt-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nested-virt-demo
+  template:
+    metadata:
+      labels:
+        app: nested-virt-demo
+    spec:
+      # Steer pods onto the nested-virt NodePool. Karpenter will provision
+      # an *8i* instance with nestedVirtualization enabled to satisfy this.
+      nodeSelector:
+        blueprint: nested-virtualization
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: verify
+          image: public.ecr.aws/amazonlinux/amazonlinux:2023
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              echo "=== CPU virtualization extensions in /proc/cpuinfo ==="
+              grep -om1 'vmx\|svm' /proc/cpuinfo \
+                || (echo "FAIL: no vmx or svm flag exposed"; exit 1)
+              echo ""
+              echo "=== /dev/kvm ==="
+              ls -l /dev/kvm \
+                || (echo "FAIL: /dev/kvm not present"; exit 1)
+              echo ""
+              echo "PASS: nested virtualization is accessible from this pod."
+              # Keep the pod running so its status can be exec'd for verification.
+              sleep infinity
+          securityContext:
+            privileged: true
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
