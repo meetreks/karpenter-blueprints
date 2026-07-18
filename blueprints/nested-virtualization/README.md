@@ -38,32 +38,48 @@ kubectl get ec2nodeclass nested-virt
 kubectl get nodepool nested-virt
 ```
 
-Deploy the verification workload (a privileged pod that inspects the host CPU and checks for `/dev/kvm`):
+Deploy the verification workload — a privileged pod that inspects the host CPU and checks for `/dev/kvm`. Here's the relevant slice inline:
+
+```yaml
+spec:
+  nodeSelector:
+    blueprint: nested-virtualization
+  containers:
+    - name: verify
+      image: public.ecr.aws/amazonlinux/amazonlinux:2023
+      securityContext:
+        privileged: true      # required to see /dev/kvm
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          grep -om1 'vmx\|svm' /proc/cpuinfo || exit 1
+          ls -l /dev/kvm || exit 1
+          sleep infinity
+```
+
+`privileged: true` is intentional for the demonstration — real nested-virt workloads (Kata Containers, KVM CI runners) would use a proper RuntimeClass plus a KVM device plugin instead of a privileged pod.
+
+Apply it:
 
 ```sh
 kubectl apply -f workload.yaml
 ```
 
-The workload has a nodeSelector for `karpenter.sh/nodepool: nested-virt` so it will only schedule on nodes this blueprint provisions. Karpenter will provision an `*8i*` instance to accommodate it (typically `m8i.large` under the requirements below).
-
-## Results
-
-**What Karpenter provisions:** an instance from one of the `*8i*` families (`c8i`, `m8i`, `r8i`). You can confirm the instance type and the fact that nested virt is functional two ways — from the AWS control plane (informational) and from inside the pod (definitive).
-
-**Control-plane view (informational):**
+Karpenter provisions an `*8i*` instance to accommodate the workload (typically `m8i.large` under the requirements above). Watch the provisioning through the NodeClaim:
 
 ```sh
-INSTANCE_ID=$(kubectl get nodes -l karpenter.sh/nodepool=nested-virt \
-  -o jsonpath='{.items[0].spec.providerID}' | awk -F/ '{print $NF}')
+kubectl get nodeclaim -l karpenter.sh/nodepool=nested-virt -w
 
-aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
-  --query 'Reservations[0].Instances[0].{Type:InstanceType,CpuOptions:CpuOptions}' \
-  --output json
+# When Ready, look at the details — instance type, capacity type,
+# and the launch events (Nominated/Launched/Registered/Ready):
+kubectl describe nodeclaim -l karpenter.sh/nodepool=nested-virt
 ```
 
-Note that `CpuOptions.NestedVirtualization` in the response can appear as `null`/`None` on `*8i*` families even when nested virt is functional. These families natively pass CPU virt extensions through the Nitro System — the field only echoes back in the API response when explicitly set at launch time in a way that differs from the family's default state. Karpenter's role is to *pick a family that supports nested virt* (via the `NestedVirtualizationFilter`) and forward the CpuOption in the launch template; the operational proof lives in the pod, not in the metadata.
+## Verify nested virtualization is functional
 
-**Data-plane view (definitive):**
+Two independent checks — one from the AWS control plane (informational), one from inside the pod (definitive).
+
+**Data-plane check (definitive proof):**
 
 ```sh
 POD=$(kubectl get pod -l app=nested-virt-demo -o jsonpath='{.items[0].metadata.name}')
@@ -77,7 +93,22 @@ kubectl exec "$POD" -- ls -l /dev/kvm
 # Expected: crw-rw----+ 1 root kvm ... /dev/kvm
 ```
 
-**Not-provisioned scenario:** if you edit the NodePool requirements to include a family that doesn't support nested virtualization (say `m7i`), Karpenter will reject that instance type and refuse to schedule. You'll see:
+If both come back positive, nested virt is fully functional on the pod's host node.
+
+**Control-plane check (informational):**
+
+```sh
+INSTANCE_ID=$(kubectl get nodes -l karpenter.sh/nodepool=nested-virt \
+  -o jsonpath='{.items[0].spec.providerID}' | awk -F/ '{print $NF}')
+
+aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+  --query 'Reservations[0].Instances[0].{Type:InstanceType,CpuOptions:CpuOptions}' \
+  --output json
+```
+
+Note that `CpuOptions.NestedVirtualization` in the response can appear as `null`/`None` on `*8i*` families even when nested virt is functional. These families natively pass CPU virt extensions through the Nitro System — the field only echoes back in the API response when explicitly set at launch time in a way that differs from the family's default state. Karpenter's role is to *pick a family that supports nested virt* (via the `NestedVirtualizationFilter`) and forward the CpuOption in the launch template; the operational proof lives in the pod, not in the metadata.
+
+**Negative case:** if you edit the NodePool requirements to include a family that doesn't support nested virtualization (say `m7i`), Karpenter will reject that instance type. You'll see:
 
 ```sh
 kubectl get events --field-selector reason=FailedScheduling
