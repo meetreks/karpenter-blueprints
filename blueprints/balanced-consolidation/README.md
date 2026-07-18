@@ -2,41 +2,42 @@
 
 ## Purpose
 
-Karpenter's `consolidationPolicy` decides which nodes are candidates for consolidation. The default `WhenEmptyOrUnderutilized` policy is aggressive — any node that could be removed or replaced to reduce cost is fair game — which can produce churn: marginal consolidations where the saved dollars are small relative to the number of pods disrupted, and, in some workload shapes, oscillation as pods reschedule onto a node that then becomes underutilized itself.
+Karpenter's `consolidationPolicy` decides which nodes are candidates for consolidation. The default `WhenEmptyOrUnderutilized` is aggressive — any node that could be removed or replaced to reduce cost is fair game — which produces two behaviors customers commonly hit:
 
-The `Balanced` policy (introduced in Karpenter v1.14) addresses this by **scoring** every consolidation action instead of only checking feasibility. It considers the same set of nodes as `WhenEmptyOrUnderutilized`, but takes the action only when the estimated cost savings are worth the disruption to the pods that would be evicted.
+- **Marginal replaces.** A node running just a couple of pods that could technically fit on a same-or-similar-family instance gets replaced. Savings are near zero; several pods get evicted for no real benefit.
+- **Consolidation timing pressure.** To contain this, customers reach for scheduled `disruption.budgets` with `nodes: 0` windows during business hours, effectively pausing consolidation until off-hours. That controls the *when* but not the *what* — off-hours consolidation still churns marginal moves.
 
-The score is a ratio:
+The `Balanced` policy (Karpenter v1.14+) addresses the *what*: it **scores every consolidation action** and only proceeds when the estimated savings are worth the pod disruption. Because it filters out the marginal actions that made scheduled budgets attractive, teams can be less restrictive with their budget windows once Balanced is in play.
+
+The score is a ratio computed per action:
 
 ```
 score = savings_fraction / disruption_fraction
+
+  savings_fraction    = savings / nodepool_total_cost
+  disruption_fraction = disruption_cost / nodepool_total_disruption_cost
 ```
 
-where `savings_fraction` is the candidate node's cost as a share of the NodePool's total cost, and `disruption_fraction` is the disruption weight of the pods on that node as a share of the NodePool's total pod disruption weight. Karpenter approves an action only when the score clears its threshold. Empty nodes have effectively zero disruption weight, so they always clear — meaning `Balanced` still removes empty nodes just like `WhenEmpty` would.
+An action is approved when `score >= 1/k`. Balanced uses `k = 2`, so the effective **approval threshold is 0.5** — the savings must cover at least half the disruption in fractional terms. Both sides are dimensionless, so the threshold is scale-invariant across cluster sizes. Two levers change per-pod disruption weight in the numerator:
 
-By default every pod contributes equal disruption weight, so the disruption term reduces to a pod count. Two levers change that per-pod weight:
+- **Pod priority.** Higher-priority pods count as more disruptive, making their host less consolidation-worthy.
+- **`controller.kubernetes.io/pod-deletion-cost` annotation.** Per-pod override on disruption weight.
 
-- **Pod priority** — higher-priority pods count as more disruptive, making their host node less likely to be consolidated.
-- **`controller.kubernetes.io/pod-deletion-cost` annotation** — user-supplied override on per-pod disruption weight (positive values increase weight, negative decrease).
-
-Balanced runs the same three consolidation mechanisms as the other policies:
+Balanced still runs the same three consolidation mechanisms as the other policies:
 
 | Mechanism | Balanced behavior |
 | --- | --- |
-| Empty Node Consolidation | Empty nodes score with disruption ≈ 0, always clear the threshold. Same behavior as `WhenEmpty`. |
-| Multi-Node Consolidation | The batch's combined savings is scored against the batch's combined disruption. Individually-marginal nodes can still combine into a passing group. |
-| Single-Node Consolidation | Scored per node. A same-type or near-zero-savings replacement scores ≈ 0 and is rejected. This is what closes the consolidation loops sometimes observed under `WhenEmptyOrUnderutilized`. |
+| Empty node consolidation | Empty nodes always clear the threshold (disruption is small, savings dominate). Same behavior as `WhenEmpty`. |
+| Multi-node consolidation | The batch's combined savings scores against the batch's combined disruption. Individually-marginal nodes can combine into a passing group. |
+| Single-node consolidation | Scored per node. Same-type or near-zero-savings replaces score below 0.5 and are rejected. |
 
-Pick `Balanced` when you want most of the cost savings of `WhenEmptyOrUnderutilized` but not the churn from marginal consolidations — especially in clusters with many small workloads, priority-classed workloads, or where you've seen "node deleted, replacement provisioned, same type, no savings" loops.
-
-For the reference behavior and full documentation, see the Karpenter [Balanced consolidation docs](https://karpenter.sh/docs/concepts/disruption/#balanced-consolidation) and the [NodePool disruption spec](https://karpenter.sh/docs/concepts/nodepools/).
+Reference: [Karpenter Balanced consolidation docs](https://karpenter.sh/docs/concepts/disruption/#balanced-consolidation) and the [design RFC](https://github.com/kubernetes-sigs/karpenter/blob/main/designs/balanced-consolidation.md) (see "Why k=2" for the choice of threshold).
 
 ## Requirements
 
-- An EKS cluster running Karpenter **v1.14 or later**. Earlier versions do not accept `Balanced` as a `consolidationPolicy` value and will reject the NodePool.
-- An `EC2NodeClass` named `default` (self-managed Karpenter) or a Node Class named `default` (EKS Auto Mode). The cluster template in this repo creates one.
-- Ability to deploy the sample workload (`workload.yaml`) and scale it. No special IAM permissions beyond a standard Karpenter install.
-- (Optional, for the observability section) `kubectl port-forward` access to `svc/karpenter` in `kube-system` to read Prometheus metrics on `:8080`.
+- An EKS cluster running Karpenter **v1.14 or later**. Earlier versions do not accept `Balanced` as a `consolidationPolicy` value.
+- The reference cluster template in this repo provisions a `default` `EC2NodeClass` and `NodePool`. This blueprint does **not** modify either — it creates its own `balanced-consolidation` NodePool alongside them so this blueprint can be deployed and tested in parallel with others.
+- A workload you don't mind scaling up and down a few times. The sample `workload.yaml` in this folder is a `pause`-based inflate deployment.
 
 ## Deploy
 
@@ -52,127 +53,197 @@ kubectl apply -f balanced-consolidation.yaml
 kubectl apply -f balanced-consolidation-automode.yaml
 ```
 
-Both manifests replace or create a NodePool named `default` with `consolidationPolicy: Balanced` and a 30-second `consolidateAfter`. The Auto Mode variant differs only in the `nodeClassRef` (`eks.amazonaws.com/NodeClass` instead of `karpenter.k8s.aws/EC2NodeClass`) and skips the requirements block since Auto Mode's built-in NodeClass covers instance selection.
+Both manifests create a **new** `EC2NodeClass` and `NodePool` named `balanced-consolidation`. The Auto Mode variant differs only in the `nodeClassRef` (`eks.amazonaws.com/NodeClass` instead of `karpenter.k8s.aws/EC2NodeClass`) and reuses Auto Mode's built-in `default` NodeClass.
 
-Verify the NodePool is `Ready`:
-
-```sh
-kubectl get nodepool default
-kubectl get nodepool default -o jsonpath='{.spec.disruption.consolidationPolicy}{"\n"}'
-```
-
-Then apply the sample workload — an `inflate` deployment plus two `PriorityClass` resources so you can demonstrate the priority-weighted disruption behavior:
+Apply the sample workload — three deployments (baseline, low-priority, high-priority) plus two PriorityClasses:
 
 ```sh
 kubectl apply -f workload.yaml
 ```
 
-### Scenario A — Empty node consolidation (baseline)
+All deployments start at `replicas: 0` and use `nodeSelector: blueprint=balanced-consolidation`, so they only ever schedule onto this blueprint's own NodePool. Scaling them is how you drive the walkthrough below.
 
-Scale up, then scale to zero:
+## Walkthrough
 
-```sh
-kubectl scale deployment inflate --replicas=5
-# wait for Karpenter to provision a node and pods to be Running
-kubectl scale deployment inflate --replicas=0
-```
+The rest of this document is a **progression** on the same workload, comparing `WhenEmptyOrUnderutilized` and `Balanced` and then introducing priority. Each step tells you what to do, what to look for, and what it means.
 
-You should observe the Karpenter-provisioned node get consolidated within a minute of `consolidateAfter` elapsing. Because the node is empty, its disruption is ≈ 0, so `Balanced` behaves identically to `WhenEmpty` here.
+---
 
-### Scenario B — Marginal single-node consolidation (rejected)
+### Step 1 — Baseline: `WhenEmptyOrUnderutilized` on the same workload
 
-Scale to a size that produces a node running only a couple of pods where the only feasible replacement is the same or near-identical instance type. Without Balanced, `WhenEmptyOrUnderutilized` would attempt a same-type replacement, produce ≈ 0 net savings, and re-attempt on the next reconcile — a churn loop. Balanced scores this action, finds savings ≈ 0 relative to non-zero disruption, and **rejects** it. The node stays put.
+Switch the blueprint's NodePool to the traditional policy so you have a clean baseline:
 
 ```sh
-kubectl scale deployment inflate --replicas=2
+kubectl patch nodepool balanced-consolidation --type=merge \
+  -p '{"spec":{"disruption":{"consolidationPolicy":"WhenEmptyOrUnderutilized"}}}'
 ```
 
-Watch decisions:
+Scale the baseline `balanced-inflate` deployment up to trigger provisioning, wait for the pods to schedule, and check where they land:
 
 ```sh
-kubectl get events -n default --field-selector reason=ConsolidationApproved
-kubectl logs -n kube-system -l app.kubernetes.io/name=karpenter --tail=100 | grep -i consolidat
+kubectl scale deployment balanced-inflate --replicas=8
 ```
 
-### Scenario C — Priority-weighted disruption
+The relevant bit of that deployment (pinned to this blueprint's NodePool):
 
-Deploy two workloads at different priorities on two different nodes. Balanced weights the high-priority pod's disruption higher, making its host node less consolidation-worthy than the low-priority node.
+```yaml
+spec:
+  template:
+    spec:
+      nodeSelector:
+        blueprint: balanced-consolidation
+      containers:
+        - name: inflate
+          image: public.ecr.aws/eks-distro/kubernetes/pause:3.7
+          resources:
+            requests: {cpu: "1", memory: "1Gi"}
+```
+
+Karpenter provisions a node from the pool (typically a `c*.2xlarge` or similar to absorb 8 CPUs). Now scale down to a size that leaves the node clearly underutilized — say 3 pods — and watch what Karpenter does:
 
 ```sh
-kubectl scale deployment inflate --replicas=0
-kubectl apply -f workload.yaml   # includes high-pri and low-pri variants
+kubectl scale deployment balanced-inflate --replicas=3
+kubectl get nodeclaim -l karpenter.sh/nodepool=balanced-consolidation -w
 ```
 
-The `workload.yaml` in this folder defines:
+Two things you may see under `WhenEmptyOrUnderutilized`:
 
-- `inflate-lowpri` — 3 replicas at priority `karpenter-blueprint-low` (value 100)
-- `inflate-highpri` — 3 replicas at priority `karpenter-blueprint-high` (value 1000)
+1. If 3 pods happen to fit on a smaller replacement, Karpenter **replaces** the node with a cheaper one — 3 pods get evicted and rescheduled. Savings are real but modest; the disruption isn't scored.
+2. If no cheaper replacement is feasible, Karpenter emits an `Unconsolidatable` event and the node stays.
 
-Both fit on a single Karpenter-provisioned node initially; scale up so they end up on separate nodes, then scale down so one becomes a consolidation candidate. Balanced should prefer consolidating the `inflate-lowpri` node.
-
-## Results
-
-There are three signals to watch: **metrics**, **events**, and **debug logs**. Which of them fire depends on which consolidation path Karpenter takes.
-
-### Two consolidation paths — one scored, one not
-
-Balanced runs alongside the classic **empty-node fast path**. When a node has no pods (or only pods that are cheap to move — like daemonsets), Karpenter deletes it directly without scoring. When a node has running workload pods and consolidating it requires either evicting them or launching a smaller replacement, Balanced runs the scorer.
-
-You'll observe them differently:
-
-| Path | When it fires | Event | Metric |
-| --- | --- | --- | --- |
-| Empty-node delete | Node has no workload pods, or all pods can move to existing free capacity | `DisruptionTerminating` with message `Disrupting Node: Empty` | `karpenter_voluntary_disruption_decisions_total{consolidation_type="empty",decision="delete",reason="empty"}` |
-| Scored consolidation | Node has workload pods that need to be evicted or replaced, and a cheaper replacement is feasible | `ConsolidationApproved` (approved) or `Unconsolidatable` (rejected) | `karpenter_consolidation_score`, `karpenter_consolidation_moves_total` (both labeled by `decision`, `nodepool`, `policy`) |
-
-The `karpenter_consolidation_score` and `karpenter_consolidation_moves_total` metrics are lazy-initialized. They only appear in `/metrics` **after the scorer has actually run at least once**, which requires a scenario where a scored consolidation action is at least evaluated — not just a scale-up-then-down that resolves via the empty-node fast path.
-
-### What you should see for each scenario
-
-**Scenario A (empty node)** — expect:
+Look for the eviction/replacement activity:
 
 ```sh
-$ kubectl get events --sort-by='.lastTimestamp' | grep -i disrupting
-Normal  DisruptionTerminating  node/ip-...  Disrupting Node: Empty
-Normal  DisruptionTerminating  nodeclaim/... Disrupting NodeClaim: Empty
+kubectl get events --field-selector reason=DisruptionTerminating --sort-by=.lastTimestamp
+kubectl get events --field-selector reason=Unconsolidatable --sort-by=.lastTimestamp
 ```
+
+You'll see event messages like `Disrupting Node: Underutilized` or `Can't replace with a cheaper node`. Under `WhenEmptyOrUnderutilized`, every feasible replace is attempted — including marginal ones.
+
+---
+
+### Step 2 — Switch to `Balanced`, same workload
+
+Patch the policy without changing the workload:
 
 ```sh
-$ curl -s :8080/metrics | grep 'consolidation_type="empty"'
-karpenter_voluntary_disruption_decisions_total{consolidation_type="empty",decision="delete",reason="empty"} 1
+kubectl patch nodepool balanced-consolidation --type=merge \
+  -p '{"spec":{"disruption":{"consolidationPolicy":"Balanced"}}}'
 ```
 
-The score metrics stay absent because empty-node consolidation doesn't score.
-
-**Scenario B (marginal / unconsolidatable)** — with a PodDisruptionBudget blocking evictions or a workload shape where no cheaper instance fits, Karpenter's feasibility check will reject before the scorer runs. Expect:
+Repeat the same scale-down cycle:
 
 ```sh
-$ kubectl get events --field-selector reason=Unconsolidatable
-Normal  Unconsolidatable  nodeclaim/...  Can't replace with a cheaper node
+kubectl scale deployment balanced-inflate --replicas=8
+# wait for provisioning
+kubectl scale deployment balanced-inflate --replicas=3
 ```
 
-This event tells you Karpenter tried to find a consolidation option and couldn't — the scoring never runs.
-
-**Scenario C (priority-weighted)** — when a feasible scored consolidation exists, expect a `ConsolidationApproved` event on the chosen node/NodeClaim, with the score and percentages in its message. In parallel, `karpenter_consolidation_score` and `karpenter_consolidation_moves_total` will appear on `/metrics`, and enabling `LOG_LEVEL=debug` on the controller will surface per-decision scoring detail in the logs.
-
-Enable debug logs by patching the deployment:
+Now watch for **`ConsolidationApproved`** and **`ConsolidationRejected`** events. Balanced emits both, with the score inline:
 
 ```sh
-kubectl set env deploy/karpenter -n kube-system LOG_LEVEL=debug
+kubectl get events --field-selector reason=ConsolidationApproved --sort-by=.lastTimestamp
+kubectl get events --field-selector reason=ConsolidationRejected --sort-by=.lastTimestamp
 ```
 
-Then follow along:
+The event message looks like:
+
+```
+score 0.32 < threshold 0.50 (k: 2, savings 12.5%, disruption 38.7%)
+```
+
+For **single-node** consolidation actions, `ConsolidationApproved`/`ConsolidationRejected` fire on the individual NodeClaim, so you can inspect the decision directly on the node object:
 
 ```sh
-kubectl logs -n kube-system -l app.kubernetes.io/name=karpenter -f | grep -iE "consolidat|score"
+kubectl describe nodeclaim -l karpenter.sh/nodepool=balanced-consolidation
 ```
 
-### Sizing your test cluster
+For **multi-node** actions, the event fires on the NodePool instead (because the score describes the batch, not any single node):
 
-To reliably elicit the scorer, your cluster needs enough diverse compute for Karpenter to have both an "evict and move pods" option **and** a feasible "replace with smaller/cheaper instance" option. A tiny test cluster where every workload fits on the system nodes will mostly exercise the empty-node fast path — you'll see `Balanced` accept those actions but you won't see the scoring signals fire.
+```sh
+kubectl describe nodepool balanced-consolidation
+```
 
-### Takeaway
+**What you should see:** empty nodes still get consolidated (their score clears the threshold easily). Marginal replaces — the same actions that would fire under `WhenEmptyOrUnderutilized` — get scored and, when savings-fraction is less than half the disruption-fraction, rejected. The node stays. Pods aren't evicted for no reason.
 
-- Balanced still removes empty and clearly-under-utilized nodes — you don't lose the base consolidation behavior.
-- Balanced adds a scoring gate on non-empty consolidations that would otherwise churn the cluster for marginal savings.
-- The `karpenter_consolidation_score` / `karpenter_consolidation_moves_total` metrics and `ConsolidationApproved` events give you the *"why"* behind each approved or rejected action.
+Metrics-side observation (the exposed histograms are lazy-initialized, so they appear once at least one scored action has been evaluated):
+
+```sh
+kubectl -n kube-system port-forward svc/karpenter 8080:8080 &
+curl -s :8080/metrics | grep karpenter_consolidation_score
+curl -s :8080/metrics | grep karpenter_consolidation_moves_total
+```
+
+`karpenter_consolidation_score` is a histogram bucketed at `{0.1, 0.25, 0.33, 0.5, 1.0, 2.0, 5.0, 10.0}`. `karpenter_consolidation_moves_total` is a counter labeled by `decision` (`approved`/`rejected`), `nodepool`, and `policy`.
+
+---
+
+### Step 3 — Priority-weighted disruption
+
+Now the story escalates. Some of your workloads have become more important — you want their eviction to weigh heavier in consolidation decisions.
+
+Clean up the baseline and switch to the two priority-classed deployments:
+
+```sh
+kubectl scale deployment balanced-inflate --replicas=0
+kubectl scale deployment balanced-inflate-highpri --replicas=3
+kubectl scale deployment balanced-inflate-lowpri  --replicas=3
+```
+
+The relevant bits of those two deployments, inline:
+
+```yaml
+# balanced-inflate-highpri
+spec:
+  template:
+    spec:
+      priorityClassName: balanced-blueprint-high   # value 1000
+      nodeSelector: {blueprint: balanced-consolidation}
+      containers:
+        - name: inflate
+          image: public.ecr.aws/eks-distro/kubernetes/pause:3.7
+          resources: {requests: {cpu: "1", memory: "1Gi"}}
+```
+
+```yaml
+# balanced-inflate-lowpri — same shape, priorityClassName: balanced-blueprint-low (value 100)
+```
+
+Karpenter provisions capacity and the pods spread across the pool's nodes. Scale one deployment down to create an underutilization opportunity:
+
+```sh
+kubectl scale deployment balanced-inflate-lowpri --replicas=1
+```
+
+Because Balanced weights per-pod disruption by pod priority, the node hosting **more high-priority pods** carries a larger `disruption_fraction` — its score sits below the threshold and it stays. The node hosting the mostly-low-priority pods carries a smaller `disruption_fraction` — its score clears the threshold and it gets consolidated.
+
+Verify:
+
+```sh
+kubectl get pods -l app=balanced-inflate-highpri -o wide
+kubectl get pods -l app=balanced-inflate-lowpri  -o wide
+kubectl get events --field-selector reason=ConsolidationApproved --sort-by=.lastTimestamp
+```
+
+You should see the low-priority host go through `ConsolidationApproved` → `DisruptionTerminating`, while the high-priority host emits `ConsolidationRejected` with a score below 0.50.
+
+## Takeaways
+
+- **Same base behavior.** Balanced still removes empty and clearly-underutilized nodes — you don't lose the base consolidation.
+- **Marginal actions blocked.** Balanced adds a scoring gate that rejects marginal single-node replaces, which is where `WhenEmptyOrUnderutilized`'s churn came from.
+- **Priority is a first-class signal.** Higher-priority pods make their host less consolidation-worthy, so you can steer consolidation away from critical workloads with the `PriorityClass` you probably already use for scheduling.
+- **Budget windows can relax.** If you had scheduled `disruption.budgets` with `nodes: 0` windows to contain churn, Balanced removes much of the reason to. Windows still matter for high-blast-radius operations (drift, expiration), but consolidation-driven churn is now bounded by the score gate.
+
+## Cleanup
+
+```sh
+kubectl delete -f workload.yaml
+kubectl delete -f balanced-consolidation.yaml       # or -automode.yaml
+```
+
+## References
+
+- Karpenter release notes: [v1.14.0](https://github.com/aws/karpenter-provider-aws/releases/tag/v1.14.0)
+- Karpenter disruption docs: [karpenter.sh/docs/concepts/disruption](https://karpenter.sh/docs/concepts/disruption/#balanced-consolidation)
+- Balanced consolidation RFC: [designs/balanced-consolidation.md](https://github.com/kubernetes-sigs/karpenter/blob/main/designs/balanced-consolidation.md)
+- Karpenter NodePool spec: [karpenter.sh/docs/concepts/nodepools](https://karpenter.sh/docs/concepts/nodepools/)

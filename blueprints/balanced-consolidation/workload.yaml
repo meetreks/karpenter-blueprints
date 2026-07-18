@@ -1,36 +1,44 @@
 ---
+# PriorityClass resources are cluster-scoped, so their names are prefixed to
+# avoid collision with other blueprints or workloads that also define priorities.
 apiVersion: scheduling.k8s.io/v1
 kind: PriorityClass
 metadata:
-  name: karpenter-blueprint-low
+  name: balanced-blueprint-low
 value: 100
 globalDefault: false
-description: "Low priority for the Balanced consolidation blueprint demo."
+description: "Low priority for the Balanced consolidation blueprint. Balanced treats these pods as cheaper to move, so their host is more consolidation-eligible."
 ---
 apiVersion: scheduling.k8s.io/v1
 kind: PriorityClass
 metadata:
-  name: karpenter-blueprint-high
+  name: balanced-blueprint-high
 value: 1000
 globalDefault: false
-description: "High priority for the Balanced consolidation blueprint demo. Balanced weights disruption of high-priority pods more heavily, making their host less consolidation-worthy."
+description: "High priority for the Balanced consolidation blueprint. Balanced weights disruption of high-priority pods more heavily, protecting their host from consolidation."
 ---
-# Baseline inflate deployment used in Scenarios A and B.
-# Starts at 0 replicas so you can drive it up/down interactively.
+# Baseline deployment used in the WhenEmptyOrUnderutilized comparison and the
+# 'switch to Balanced' step. All workloads in this blueprint use nodeSelector so
+# they land exclusively on nodes provisioned by the blueprint's own NodePool.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: inflate
+  name: balanced-inflate
+  labels:
+    blueprint: balanced-consolidation
 spec:
   replicas: 0
   selector:
     matchLabels:
-      app: inflate
+      app: balanced-inflate
   template:
     metadata:
       labels:
-        app: inflate
+        app: balanced-inflate
+        blueprint: balanced-consolidation
     spec:
+      nodeSelector:
+        blueprint: balanced-consolidation
       terminationGracePeriodSeconds: 0
       containers:
         - name: inflate
@@ -40,22 +48,28 @@ spec:
               cpu: "1"
               memory: "1Gi"
 ---
-# Low-priority variant for Scenario C (priority-weighted disruption).
+# Low-priority variant for the priority-weighted step. Same nodeSelector so it
+# lands on the blueprint's NodePool.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: inflate-lowpri
+  name: balanced-inflate-lowpri
+  labels:
+    blueprint: balanced-consolidation
 spec:
   replicas: 0
   selector:
     matchLabels:
-      app: inflate-lowpri
+      app: balanced-inflate-lowpri
   template:
     metadata:
       labels:
-        app: inflate-lowpri
+        app: balanced-inflate-lowpri
+        blueprint: balanced-consolidation
     spec:
-      priorityClassName: karpenter-blueprint-low
+      priorityClassName: balanced-blueprint-low
+      nodeSelector:
+        blueprint: balanced-consolidation
       terminationGracePeriodSeconds: 0
       containers:
         - name: inflate
@@ -65,24 +79,28 @@ spec:
               cpu: "1"
               memory: "1Gi"
 ---
-# High-priority variant for Scenario C.
-# Balanced counts these as more disruptive to move, so their host node
-# is less likely to be picked for single-node consolidation.
+# High-priority variant. Balanced weights these pods as more disruptive to move,
+# so their host is less likely to be picked for single-node consolidation.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: inflate-highpri
+  name: balanced-inflate-highpri
+  labels:
+    blueprint: balanced-consolidation
 spec:
   replicas: 0
   selector:
     matchLabels:
-      app: inflate-highpri
+      app: balanced-inflate-highpri
   template:
     metadata:
       labels:
-        app: inflate-highpri
+        app: balanced-inflate-highpri
+        blueprint: balanced-consolidation
     spec:
-      priorityClassName: karpenter-blueprint-high
+      priorityClassName: balanced-blueprint-high
+      nodeSelector:
+        blueprint: balanced-consolidation
       terminationGracePeriodSeconds: 0
       containers:
         - name: inflate

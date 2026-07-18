@@ -1,14 +1,43 @@
+---
+# This blueprint's own EC2NodeClass. Lives alongside the cluster's default and
+# does not modify it, so this blueprint can be exercised in a cluster that is
+# also running other blueprints or real workloads.
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: balanced-consolidation
+spec:
+  amiFamily: AL2023
+  amiSelectorTerms:
+    - alias: al2023@latest
+  role: "<<KARPENTER_NODE_IAM_ROLE_NAME>>"
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: <<CLUSTER_NAME>>
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: <<CLUSTER_NAME>>
+  tags:
+    blueprint: balanced-consolidation
+---
+# The blueprint's own NodePool, again independent of default. Workloads for this
+# blueprint set nodeSelector: blueprint=balanced-consolidation so they land here
+# and nowhere else, and the pool's requirements are broad enough to let Karpenter
+# exercise both delete-only and replace-with-cheaper consolidation actions.
 apiVersion: karpenter.sh/v1
 kind: NodePool
 metadata:
-  name: default
+  name: balanced-consolidation
 spec:
   template:
+    metadata:
+      labels:
+        blueprint: balanced-consolidation
     spec:
       nodeClassRef:
         group: karpenter.k8s.aws
         kind: EC2NodeClass
-        name: default
+        name: balanced-consolidation
       requirements:
         - key: karpenter.k8s.aws/instance-category
           operator: In
@@ -27,11 +56,8 @@ spec:
     cpu: "100"
     memory: 400Gi
   disruption:
-    # Balanced only takes a consolidation action when the estimated cost savings
-    # are worth the disruption to running pods, measured via a per-action score.
-    # Empty and clearly-underutilized nodes still consolidate; marginal actions
-    # that under WhenEmptyOrUnderutilized would produce ~zero savings are skipped.
+    # Balanced (Karpenter v1.14+) scores every consolidation action.
+    # A move is approved when score = savings_fraction / disruption_fraction
+    # >= 1/k, where k=2, so the effective approval threshold is 0.5.
     consolidationPolicy: Balanced
     consolidateAfter: 30s
-    budgets:
-      - nodes: "10%"
