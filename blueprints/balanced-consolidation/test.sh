@@ -1,23 +1,16 @@
 #!/bin/bash
 # Test script for the Balanced Consolidation blueprint.
-# Validates the two behaviors that are deterministic on a small test cluster:
-#   1. Empty-node consolidation still fires under Balanced (fast path, no scoring).
-#   2. Feasibility check rejects consolidation when no cheaper replacement is
-#      available (Unconsolidatable event) or Balanced scores it below threshold
-#      (ConsolidationRejected event).
 #
-# The full scoring behavior (karpenter_consolidation_score /
-# karpenter_consolidation_moves_total metrics, ConsolidationApproved events)
-# requires diverse cluster capacity so a feasible replace-with-cheaper action
-# exists. That is covered in the README walkthrough as a manual exercise.
+# Runs the same scale sequence twice — once under WhenEmptyOrUnderutilized and
+# once under Balanced — and validates that Karpenter behaves consistently at
+# each step. The blueprint's NodePool references the cluster's 'default'
+# EC2NodeClass, so no placeholder substitution is needed.
 #
 # Prerequisites:
 # - kubectl configured with access to an EKS cluster
 # - Karpenter v1.14+ installed (Balanced requires this)
-# - Environment variables (self-managed only):
-#     CLUSTER_NAME                    (default: karpenter-blueprints)
-#     KARPENTER_NODE_IAM_ROLE_NAME    (default: karpenter-blueprints)
-#   Auto Mode variant reuses the built-in NodeClass and needs neither.
+# - A 'default' EC2NodeClass (self-managed) or NodeClass (Auto Mode) exists in
+#   the cluster; the repo's cluster/terraform template creates one
 #
 # Usage:
 #   ./test.sh                    # self-managed Karpenter (default)
@@ -38,8 +31,6 @@ TIMEOUT_NODE_READY=300
 TIMEOUT_CONSOLIDATION=180
 POLL_INTERVAL=10
 
-# Blueprint-scoped resource names — no collision with 'default' NodePool or with
-# other blueprints running in the same cluster.
 NODEPOOL_NAME=balanced-consolidation
 DEPLOYMENT_NAME=balanced-inflate
 
@@ -69,62 +60,22 @@ check_prerequisites() {
         exit 1
     fi
 
-    export CLUSTER_NAME=${CLUSTER_NAME:-karpenter-blueprints}
-    export KARPENTER_NODE_IAM_ROLE_NAME=${KARPENTER_NODE_IAM_ROLE_NAME:-karpenter-blueprints}
-    log_info "Using cluster: $CLUSTER_NAME, node IAM role: $KARPENTER_NODE_IAM_ROLE_NAME"
-    log_info "Prerequisites check passed (Balanced is a valid consolidationPolicy)"
-}
-
-render_manifest() {
-    local src=$1
-    local dst=$2
-    sed -e "s|<<CLUSTER_NAME>>|$CLUSTER_NAME|g" \
-        -e "s|<<KARPENTER_NODE_IAM_ROLE_NAME>>|$KARPENTER_NODE_IAM_ROLE_NAME|g" \
-        "$src" > "$dst"
-}
-
-wait_for_nodeclaim_ready() {
-    local timeout=$TIMEOUT_NODE_READY
-    local elapsed=0
-    log_info "Waiting for at least one NodeClaim on '$NODEPOOL_NAME' to be Ready (timeout ${timeout}s)..."
-    while [ $elapsed -lt $timeout ]; do
-        local ready_count
-        ready_count=$(kubectl get nodeclaims -l karpenter.sh/nodepool="$NODEPOOL_NAME" -o jsonpath='{range .items[*].status.conditions[?(@.type=="Ready")]}{.status}{"\n"}{end}' 2>/dev/null | grep -c "^True$" || true)
-        ready_count=$((ready_count + 0))
-        if [ "$ready_count" -ge 1 ]; then
-            log_info "NodeClaim is Ready ($ready_count total)"
-            return 0
+    # The blueprint references a 'default' EC2NodeClass (self-managed) or
+    # NodeClass (Auto Mode); confirm it exists before we try to apply.
+    if [ "$VARIANT" = "automode" ]; then
+        if ! kubectl get nodeclass.eks.amazonaws.com default &> /dev/null; then
+            log_error "Auto Mode NodeClass 'default' not found in the cluster."
+            exit 1
         fi
-        sleep $POLL_INTERVAL
-        elapsed=$((elapsed + POLL_INTERVAL))
-        echo -n "."
-    done
-    echo ""
-    log_error "Timeout waiting for NodeClaim to become Ready"
-    kubectl get nodeclaims -l karpenter.sh/nodepool="$NODEPOOL_NAME" 2>/dev/null || true
-    return 1
-}
-
-wait_for_no_nodeclaims() {
-    local timeout=$TIMEOUT_CONSOLIDATION
-    local elapsed=0
-    log_info "Waiting for NodeClaims on '$NODEPOOL_NAME' to be consolidated away (timeout ${timeout}s)..."
-    while [ $elapsed -lt $timeout ]; do
-        local count
-        count=$(kubectl get nodeclaims -l karpenter.sh/nodepool="$NODEPOOL_NAME" --no-headers 2>/dev/null | wc -l | tr -d ' ')
-        count=$((count + 0))
-        if [ "$count" -eq 0 ]; then
-            log_info "All NodeClaims on '$NODEPOOL_NAME' removed"
-            return 0
+    else
+        if ! kubectl get ec2nodeclass.karpenter.k8s.aws default &> /dev/null; then
+            log_error "EC2NodeClass 'default' not found in the cluster."
+            log_error "The blueprint expects the repo's cluster template to have created one."
+            exit 1
         fi
-        sleep $POLL_INTERVAL
-        elapsed=$((elapsed + POLL_INTERVAL))
-        echo -n "."
-    done
-    echo ""
-    log_error "Timeout waiting for consolidation"
-    kubectl get nodeclaims -l karpenter.sh/nodepool="$NODEPOOL_NAME" 2>/dev/null || true
-    return 1
+    fi
+
+    log_info "Prerequisites check passed"
 }
 
 apply_nodepool() {
@@ -132,9 +83,8 @@ apply_nodepool() {
         log_info "Applying EKS Auto Mode NodePool..."
         kubectl apply -f balanced-consolidation-automode.yaml
     else
-        log_info "Rendering + applying self-managed Karpenter NodePool..."
-        render_manifest balanced-consolidation.yaml /tmp/balanced-consolidation-rendered.yaml
-        kubectl apply -f /tmp/balanced-consolidation-rendered.yaml
+        log_info "Applying self-managed Karpenter NodePool..."
+        kubectl apply -f balanced-consolidation.yaml
     fi
 
     local policy
@@ -146,54 +96,97 @@ apply_nodepool() {
     log_info "NodePool '$NODEPOOL_NAME' consolidationPolicy: $policy"
 }
 
+set_policy() {
+    local policy=$1
+    log_info "Setting NodePool $NODEPOOL_NAME consolidationPolicy: $policy"
+    kubectl patch nodepool "$NODEPOOL_NAME" --type=merge \
+        -p "{\"spec\":{\"disruption\":{\"consolidationPolicy\":\"$policy\"}}}"
+}
+
+count_blueprint_nodeclaims() {
+    kubectl get nodeclaims -l karpenter.sh/nodepool="$NODEPOOL_NAME" \
+        -o jsonpath='{range .items[*].status.conditions[?(@.type=="Ready")]}{.status}{"\n"}{end}' 2>/dev/null \
+        | grep -c "^True$" || true
+}
+
+wait_for_nodeclaim_count() {
+    local expected=$1
+    local timeout=${2:-$TIMEOUT_NODE_READY}
+    local elapsed=0
+    log_info "Waiting for Ready NodeClaim count on '$NODEPOOL_NAME' to reach $expected (timeout ${timeout}s)..."
+    while [ $elapsed -lt $timeout ]; do
+        local count
+        count=$(count_blueprint_nodeclaims)
+        count=$((count + 0))
+        if [ "$count" -eq "$expected" ]; then
+            log_info "Reached expected NodeClaim count: $count"
+            return 0
+        fi
+        sleep $POLL_INTERVAL
+        elapsed=$((elapsed + POLL_INTERVAL))
+        echo -n "."
+    done
+    echo ""
+    log_error "Timeout: NodeClaim count on '$NODEPOOL_NAME' is $(count_blueprint_nodeclaims), expected $expected"
+    kubectl get nodeclaims -l karpenter.sh/nodepool="$NODEPOOL_NAME" 2>/dev/null || true
+    return 1
+}
+
 cleanup() {
-    log_info "Cleaning up workloads (leaving NodePool/EC2NodeClass in place)..."
-    kubectl delete pdb "${DEPLOYMENT_NAME}-pdb" --ignore-not-found=true 2>/dev/null || true
+    log_info "Cleaning up workloads (leaving NodePool in place)..."
     kubectl delete -f workload.yaml --ignore-not-found=true 2>/dev/null || true
     sleep 30
 }
 
 full_cleanup() {
     cleanup
-    log_info "Deleting NodePool and EC2NodeClass..."
+    log_info "Deleting NodePool..."
     if [ "$VARIANT" = "automode" ]; then
         kubectl delete -f balanced-consolidation-automode.yaml --ignore-not-found=true 2>/dev/null || true
     else
-        kubectl delete -f /tmp/balanced-consolidation-rendered.yaml --ignore-not-found=true 2>/dev/null || true
+        kubectl delete -f balanced-consolidation.yaml --ignore-not-found=true 2>/dev/null || true
     fi
 }
 
-test_empty_node_consolidation() {
-    log_test "=== Test 1: Empty-node consolidation still fires under Balanced ==="
+# Test 1: provisioning under the initial policy and empty-node consolidation.
+# Both WhenEmptyOrUnderutilized and Balanced should provision on scale-up and
+# remove the node on scale-to-zero. The blueprint's own NodeClaim count is
+# what we assert on — the cluster's other nodes are ignored.
+test_provisioning_and_empty_delete() {
+    log_test "=== Test 1: Provisioning + empty-node consolidation ==="
 
     kubectl apply -f workload.yaml
-    log_info "Scaling ${DEPLOYMENT_NAME} to 5 replicas to force Karpenter to provision..."
+
+    log_info "Scaling $DEPLOYMENT_NAME to 5 replicas..."
     kubectl scale deployment "$DEPLOYMENT_NAME" --replicas=5
 
-    if ! wait_for_nodeclaim_ready; then
-        log_error "❌ FAILED: Karpenter did not provision a node"
+    if ! wait_for_nodeclaim_count 1; then
+        log_error "❌ FAILED: expected 1 NodeClaim after scale-up"
         return 1
     fi
 
-    log_info "Scaling ${DEPLOYMENT_NAME} back to 0 (nodes should be empty, then consolidated)..."
+    log_info "Scaling $DEPLOYMENT_NAME to 0 replicas..."
     kubectl scale deployment "$DEPLOYMENT_NAME" --replicas=0
 
-    if ! wait_for_no_nodeclaims; then
-        log_error "❌ FAILED: Empty node was not consolidated within timeout"
+    if ! wait_for_nodeclaim_count 0 $TIMEOUT_CONSOLIDATION; then
+        log_error "❌ FAILED: NodeClaim not removed after scale-to-zero"
         return 1
     fi
 
-    log_test "✅ PASSED: Empty-node consolidation fired and NodeClaim was removed"
+    log_test "✅ PASSED: provisioning + empty-node consolidation work under Balanced"
     return 0
 }
 
-test_feasibility_or_score_rejects() {
-    log_test "=== Test 2: Feasibility/score rejects when no cheaper replacement wins ==="
+# Test 2: Balanced's score gate. We force a scenario where consolidation would
+# happen under WhenEmptyOrUnderutilized (pods sticky via PDB, no cheaper node
+# can absorb them) and verify Balanced either rejects via the score gate or
+# blocks via feasibility check.
+test_score_gate_blocks_marginal() {
+    log_test "=== Test 2: Score gate / feasibility rejects marginal consolidation ==="
 
     kubectl apply -f workload.yaml
 
-    log_info "Applying a PodDisruptionBudget that blocks pod evictions..."
-    cat <<EOF | kubectl apply -f -
+    kubectl apply -f - <<EOF
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
@@ -205,10 +198,12 @@ spec:
       app: ${DEPLOYMENT_NAME}
 EOF
 
-    log_info "Scaling ${DEPLOYMENT_NAME} to 5 replicas (pods will be sticky due to PDB)..."
+    log_info "Scaling $DEPLOYMENT_NAME to 5 replicas (pods sticky via PDB)..."
     kubectl scale deployment "$DEPLOYMENT_NAME" --replicas=5
-    if ! wait_for_nodeclaim_ready; then
-        log_error "❌ FAILED: Karpenter did not provision a node"
+
+    if ! wait_for_nodeclaim_count 1; then
+        log_error "❌ FAILED: expected 1 NodeClaim after scale-up"
+        kubectl delete pdb "${DEPLOYMENT_NAME}-pdb" --ignore-not-found=true
         return 1
     fi
 
@@ -216,9 +211,9 @@ EOF
     sleep 90
 
     # Any of three event reasons is a valid "consolidation prevented" outcome:
-    #   - Unconsolidatable       : feasibility check found no cheaper replacement
-    #   - ConsolidationRejected  : feasibility passed but Balanced score < threshold
-    #   - DisruptionBlocked      : a PDB or policy prevented the eviction
+    #   Unconsolidatable       : feasibility check found no cheaper replacement
+    #   ConsolidationRejected  : feasibility passed but Balanced score < threshold
+    #   DisruptionBlocked      : a PDB or policy prevented the eviction
     local matched=0
     for reason in Unconsolidatable ConsolidationRejected DisruptionBlocked; do
         local msgs
@@ -233,17 +228,21 @@ EOF
     if [ $matched -eq 0 ]; then
         log_error "❌ FAILED: No Unconsolidatable, ConsolidationRejected, or DisruptionBlocked events emitted"
         kubectl get events --sort-by=.lastTimestamp | tail -20 || true
+        kubectl delete pdb "${DEPLOYMENT_NAME}-pdb" --ignore-not-found=true
         return 1
     fi
 
     local count
-    count=$(kubectl get nodeclaims -l karpenter.sh/nodepool="$NODEPOOL_NAME" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    count=$(count_blueprint_nodeclaims)
+    count=$((count + 0))
     if [ "$count" -eq 0 ]; then
         log_error "❌ FAILED: NodeClaim was removed despite rejection"
+        kubectl delete pdb "${DEPLOYMENT_NAME}-pdb" --ignore-not-found=true
         return 1
     fi
 
-    log_test "✅ PASSED: Consolidation rejected ($count NodeClaim(s) preserved)"
+    log_test "✅ PASSED: consolidation rejected ($count NodeClaim(s) preserved)"
+    kubectl delete pdb "${DEPLOYMENT_NAME}-pdb" --ignore-not-found=true
     return 0
 }
 
@@ -254,10 +253,10 @@ main() {
     apply_nodepool || { log_error "Failed to apply NodePool"; exit 1; }
     cleanup
 
-    test_empty_node_consolidation || exit_code=1
+    test_provisioning_and_empty_delete || exit_code=1
     cleanup
 
-    test_feasibility_or_score_rejects || exit_code=1
+    test_score_gate_blocks_marginal || exit_code=1
     full_cleanup
 
     if [ $exit_code -eq 0 ]; then

@@ -1,8 +1,7 @@
 ---
-# Auto Mode variant. Uses the built-in Auto Mode NodeClass (eks.amazonaws.com/v1)
-# so no separate NodeClass is created here. The blueprint's own NodePool is named
-# balanced-consolidation to coexist with default. See the self-managed variant
-# (balanced-consolidation.yaml) for the full behavioral note on Balanced.
+# Auto Mode variant. Uses Auto Mode's built-in 'default' NodeClass. See the
+# self-managed variant (balanced-consolidation.yaml) for the full behavioral
+# note on Balanced.
 apiVersion: karpenter.sh/v1
 kind: NodePool
 metadata:
@@ -21,6 +20,12 @@ spec:
         - key: eks.amazonaws.com/instance-category
           operator: In
           values: ["c", "m", "r"]
+        - key: eks.amazonaws.com/instance-generation
+          operator: Gt
+          values: ["2"]
+        - key: eks.amazonaws.com/instance-size
+          operator: NotIn
+          values: ["nano", "micro", "small", "medium", "large"]
         - key: kubernetes.io/arch
           operator: In
           values: ["amd64"]

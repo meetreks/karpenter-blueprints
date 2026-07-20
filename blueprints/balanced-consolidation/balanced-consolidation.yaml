@@ -1,29 +1,9 @@
 ---
-# This blueprint's own EC2NodeClass. Lives alongside the cluster's default and
-# does not modify it, so this blueprint can be exercised in a cluster that is
-# also running other blueprints or real workloads.
-apiVersion: karpenter.k8s.aws/v1
-kind: EC2NodeClass
-metadata:
-  name: balanced-consolidation
-spec:
-  amiFamily: AL2023
-  amiSelectorTerms:
-    - alias: al2023@latest
-  role: "<<KARPENTER_NODE_IAM_ROLE_NAME>>"
-  subnetSelectorTerms:
-    - tags:
-        karpenter.sh/discovery: <<CLUSTER_NAME>>
-  securityGroupSelectorTerms:
-    - tags:
-        karpenter.sh/discovery: <<CLUSTER_NAME>>
-  tags:
-    blueprint: balanced-consolidation
----
-# The blueprint's own NodePool, again independent of default. Workloads for this
-# blueprint set nodeSelector: blueprint=balanced-consolidation so they land here
-# and nowhere else, and the pool's requirements are broad enough to let Karpenter
-# exercise both delete-only and replace-with-cheaper consolidation actions.
+# The blueprint's own NodePool. Points at the cluster's shared 'default'
+# EC2NodeClass (the one created by the repo's cluster template) — no separate
+# EC2NodeClass is needed for this blueprint. Workloads set
+# nodeSelector: blueprint=balanced-consolidation so they only land here,
+# leaving 'default' free for other blueprints or workloads.
 apiVersion: karpenter.sh/v1
 kind: NodePool
 metadata:
@@ -37,14 +17,28 @@ spec:
       nodeClassRef:
         group: karpenter.k8s.aws
         kind: EC2NodeClass
-        name: balanced-consolidation
+        name: default
+      # Requirements pinned tightly so consolidation transitions are visible
+      # by watching instance-type changes across scale steps:
+      # - c/m/r families cover common workload shapes; Karpenter picks the
+      #   cheapest option per step (typically c*.xlarge for CPU-bound loads)
+      # - excluding small sizes forces xlarge or larger, so replace-with-smaller
+      #   moves are meaningful (e.g. 2xlarge -> xlarge) rather than getting
+      #   lost in nano/micro noise
+      # - on-demand only; spot introduces price variability that muddles the demo
       requirements:
         - key: karpenter.k8s.aws/instance-category
           operator: In
           values: ["c", "m", "r"]
         - key: karpenter.k8s.aws/instance-generation
           operator: Gt
-          values: ["5"]
+          values: ["2"]
+        - key: karpenter.k8s.aws/instance-size
+          operator: NotIn
+          values: ["nano", "micro", "small", "medium", "large"]
+        - key: karpenter.k8s.aws/instance-hypervisor
+          operator: In
+          values: ["nitro"]
         - key: kubernetes.io/arch
           operator: In
           values: ["amd64"]
