@@ -27,24 +27,18 @@ Reference: [Karpenter Balanced consolidation docs](https://karpenter.sh/docs/con
 
 ## Requirements
 
-- An EKS cluster running Karpenter **v1.14 or later**.
-- The cluster's default `EC2NodeClass` (self-managed) or `NodeClass` (Auto Mode) exists. The repo's `cluster/terraform/` template creates one named `default`, and this blueprint references it.
+- An EKS cluster running self-managed Karpenter **v1.14 or later**. The repo's `cluster/terraform/` template installs a compatible version.
+- The cluster's default `EC2NodeClass` exists. The repo's cluster template creates one named `default`, and this blueprint references it.
+
+> **EKS Auto Mode is not currently supported.** Auto Mode ships a bundled Karpenter build that is behind OSS v1.14, so the `NodePool` CRD in Auto Mode does not yet list `Balanced` as a valid `consolidationPolicy`. Applying this blueprint on Auto Mode fails with `Unsupported value: "Balanced": supported values: "WhenEmpty", "WhenEmptyOrUnderutilized"`. Once Auto Mode's Karpenter reaches v1.14+, the same NodePool works on Auto Mode by swapping `nodeClassRef.group` to `eks.amazonaws.com`.
 
 ## Deploy
-
-**Self-managed Karpenter:**
 
 ```sh
 kubectl apply -f balanced-consolidation.yaml
 ```
 
-**EKS Auto Mode:**
-
-```sh
-kubectl apply -f balanced-consolidation-automode.yaml
-```
-
-Both manifests create a NodePool named `balanced-consolidation` that references the cluster's `default` NodeClass. No separate NodeClass is created — the blueprint adds only what's specific to it (a NodePool + workloads), leaving `default` free for other blueprints or workloads.
+This creates a NodePool named `balanced-consolidation` that references the cluster's `default` `EC2NodeClass`. No separate NodeClass is created — the blueprint adds only what's specific to it (a NodePool + workloads), leaving `default` free for other blueprints or workloads.
 
 The NodePool pins to on-demand, generation-3+, and excludes small instance sizes (`nano`/`micro`/`small`/`medium`/`large`) so instance-type transitions during consolidation are visible in `kubectl get nodes`. Categories are limited to `c/m/r`.
 
@@ -206,6 +200,8 @@ That event tells you Karpenter's feasibility check ran but couldn't find a cheap
 
 The clearest observable difference Balanced brings over `WhenEmptyOrUnderutilized` is that pod priority now feeds into consolidation ranking. When Karpenter has to pick which of several similar nodes to consolidate, Balanced prefers to disrupt nodes hosting **lower-priority** pods.
 
+The two priority deployments (`balanced-inflate-lowpri`, `balanced-inflate-highpri`) carry mutual `podAntiAffinity` on `topologyKey: kubernetes.io/hostname`, so each tier lands on its own node. That makes the outcome deterministic: we can point at "the low-pri node" and "the high-pri node" without reasoning about pod packing on a shared instance.
+
 Ensure the pool is on Balanced and the baseline deployment is at 0. Scale up both priority-classed deployments:
 
 ```sh
@@ -247,11 +243,26 @@ kubectl scale deployment balanced-inflate-lowpri --replicas=0
 
 Because Balanced weights disruption by pod priority, the low-priority node's `disruption_fraction` is smaller — its consolidation score clears the threshold and it's removed. The high-priority node stays. If the pool were on `WhenEmptyOrUnderutilized`, the outcome is the same in this case (the low-pri node became empty). The differentiator becomes visible when *both* nodes are underutilized but not empty; Balanced picks the low-priority host to consolidate first, `WhenEmptyOrUnderutilized` picks by scheduling simulation alone.
 
+## Automated verification
+
+`test.sh` runs the four scenarios from this walkthrough end-to-end and asserts on **specific NodeClaim identities** (not just counts or cluster-wide events), so unrelated activity elsewhere in the cluster can't make it pass or fail:
+
+- **Test 1 — Provisioning + empty-node consolidation** (Steps 1 and 4). Scales the baseline to 5 then back to 0; asserts a NodeClaim appears then disappears.
+- **Test 2 — Replace transition** (Steps 1–3). Scales 5 → 10 → 3; captures the original NodeClaim's name after step 1, then asserts that specific name is gone from the pool after Balanced replaces the oversized node.
+- **Test 3 — Priority-weighted consolidation** (Step 6). Scales high-pri first, records its NodeClaim, then scales low-pri; asserts the low-pri NodeClaim (identified by which node hosts the low-pri pods) is the one consolidated when low-pri drops to 0.
+- **Test 4 — Score gate / feasibility with a PDB**. Provisions a NodeClaim, pins its pods with `minAvailable: 100%`, and looks for `Unconsolidatable` / `ConsolidationRejected` / `DisruptionBlocked` events **against that specific NodeClaim** via `--field-selector involvedObject.name=<claim>`.
+
+Run it against a cluster that meets the [Requirements](#requirements):
+
+```sh
+./test.sh
+```
+
 ## Cleanup
 
 ```sh
 kubectl delete -f workload.yaml
-kubectl delete -f balanced-consolidation.yaml       # or -automode.yaml
+kubectl delete -f balanced-consolidation.yaml
 ```
 
 ## Takeaways

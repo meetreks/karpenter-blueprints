@@ -70,6 +70,17 @@ spec:
       priorityClassName: balanced-blueprint-low
       nodeSelector:
         blueprint: balanced-consolidation
+      # Anti-affinity with the high-priority variant so each priority tier lands
+      # on its own node. Makes the priority-weighted walkthrough (README Step 6)
+      # deterministic: we can point at "the low-pri node" and "the high-pri node"
+      # rather than reasoning about pod placement within a shared instance.
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: balanced-inflate-highpri
+              topologyKey: kubernetes.io/hostname
       terminationGracePeriodSeconds: 0
       containers:
         - name: inflate
@@ -101,6 +112,13 @@ spec:
       priorityClassName: balanced-blueprint-high
       nodeSelector:
         blueprint: balanced-consolidation
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: balanced-inflate-lowpri
+              topologyKey: kubernetes.io/hostname
       terminationGracePeriodSeconds: 0
       containers:
         - name: inflate
