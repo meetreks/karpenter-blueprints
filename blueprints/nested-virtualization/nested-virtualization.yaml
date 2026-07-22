@@ -33,6 +33,9 @@ spec:
     metadata:
       labels:
         blueprint: nested-virtualization
+        # kata-deploy DaemonSet targets nodes with this label to install the
+        # Kata Containers runtime + register the kata-* RuntimeClasses.
+        katacontainers.io/kata-runtime: "true"
     spec:
       nodeClassRef:
         group: karpenter.k8s.aws

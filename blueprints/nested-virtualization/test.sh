@@ -1,16 +1,33 @@
 #!/bin/bash
 # Test script for the Nested Virtualization blueprint.
-# Verifies:
-#   1. Karpenter provisions an *8i* instance under the nested-virt NodePool.
-#   2. EC2 reports NestedVirtualizationEnabled=true on the instance's CpuOptions
-#      (control-plane confirmation).
-#   3. The demo pod sees the vmx flag in /proc/cpuinfo and /dev/kvm exists
-#      (data-plane confirmation).
+#
+# Verifies three things end-to-end:
+#
+#   Test 1 (Karpenter plumbing): Karpenter provisions an *8i* NodeClaim from
+#     the nested-virt NodePool, EC2 reports CpuOptions on the launched
+#     instance, and the demo pod sees the vmx flag + /dev/kvm.
+#
+#   Test 2 (Kata MicroVM): the kata-verify pod runs via RuntimeClass
+#     kata-qemu-runtime-rs and reports a guest kernel version that differs
+#     from the host node's kernel — proof that Kata is actively wrapping the
+#     pod in a MicroVM, not just installed.
+#
+#   Test 3 (Agent sandbox demo): the sandbox Deployment comes up on Kata,
+#     accepts POST /exec, and the kernel reported in its JSON response also
+#     differs from the host kernel — proof that arbitrary user-supplied code
+#     lands inside the MicroVM boundary.
+#
+# All assertions are scoped to this blueprint's own resources (label
+# `blueprint=nested-virtualization`, its own NodeClaims, its own workloads)
+# so the script can't accidentally pass on unrelated cluster activity.
 #
 # Prerequisites:
 # - kubectl configured with access to an EKS cluster
-# - Karpenter v1.13 or later installed (EC2NodeClass.spec.cpuOptions must be present)
-# - aws CLI configured with permissions for ec2:DescribeInstances
+# - Karpenter v1.13 or later (EC2NodeClass.spec.cpuOptions must be present)
+# - Kata Containers installed via the upstream helm chart (see README step 2).
+#   The script checks that RuntimeClass kata-qemu-runtime-rs exists and bails
+#   out with instructions if it does not.
+# - aws CLI configured with ec2:DescribeInstances permissions
 # - Environment variables:
 #     CLUSTER_NAME                    (default: karpenter-blueprints)
 #     KARPENTER_NODE_IAM_ROLE_NAME    (default: karpenter-blueprints)
@@ -29,7 +46,8 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-TIMEOUT_NODE_READY=300
+TIMEOUT_NODE_READY=420
+TIMEOUT_POD_READY=300
 POLL_INTERVAL=10
 
 log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
@@ -52,12 +70,22 @@ check_prerequisites() {
         exit 1
     fi
 
-    # Verify EC2NodeClass CRD has the v1.13+ cpuOptions.nestedVirtualization field.
+    # Karpenter v1.13+ exposes cpuOptions.nestedVirtualization on EC2NodeClass.
     local field
     field=$(kubectl get crd ec2nodeclasses.karpenter.k8s.aws -o jsonpath='{.spec.versions[?(@.name=="v1")].schema.openAPIV3Schema.properties.spec.properties.cpuOptions.properties.nestedVirtualization.enum}' 2>/dev/null || echo "")
     if [[ "$field" != *"enabled"* ]]; then
         log_error "EC2NodeClass CRD does not expose cpuOptions.nestedVirtualization."
         log_error "This blueprint requires Karpenter v1.13 or later."
+        exit 1
+    fi
+
+    # Kata's kata-qemu-runtime-rs RuntimeClass must be registered on the
+    # cluster before Test 2 and Test 3 can run. If it isn't, refuse rather
+    # than reporting a misleading failure inside the kata-verify pod.
+    if ! kubectl get runtimeclass kata-qemu-runtime-rs &> /dev/null; then
+        log_error "RuntimeClass 'kata-qemu-runtime-rs' not found on the cluster."
+        log_error "Install Kata Containers before running the test — see README step 2:"
+        log_error "  helm install kata-deploy oci://ghcr.io/kata-containers/kata-deploy-charts/kata-deploy --version 4.0.0 -n kube-system"
         exit 1
     fi
 
@@ -78,7 +106,7 @@ render_manifest() {
 
 wait_for_pod_ready() {
     local label=$1
-    local timeout=$TIMEOUT_NODE_READY
+    local timeout=${2:-$TIMEOUT_POD_READY}
     local elapsed=0
     log_info "Waiting for pod with label '$label' to be Ready (timeout ${timeout}s)..."
     while [ $elapsed -lt $timeout ]; do
@@ -100,96 +128,249 @@ wait_for_pod_ready() {
     return 1
 }
 
-cleanup() {
-    log_info "Cleaning up..."
-    kubectl delete deployment nested-virt-demo --ignore-not-found=true 2>/dev/null || true
-    kubectl delete nodepool nested-virt --ignore-not-found=true 2>/dev/null || true
-    kubectl delete ec2nodeclass nested-virt --ignore-not-found=true 2>/dev/null || true
-    sleep 30
+wait_for_pod_phase() {
+    # Wait until a pod (by name) reaches one of the given phases (space-separated).
+    local name=$1
+    local phases=$2
+    local timeout=${3:-$TIMEOUT_POD_READY}
+    local elapsed=0
+    log_info "Waiting for pod '$name' to reach phase in [$phases] (timeout ${timeout}s)..."
+    while [ $elapsed -lt $timeout ]; do
+        local phase
+        phase=$(kubectl get pod "$name" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+        for p in $phases; do
+            if [ "$phase" = "$p" ]; then
+                log_info "Pod '$name' is $phase"
+                return 0
+            fi
+        done
+        sleep $POLL_INTERVAL
+        elapsed=$((elapsed + POLL_INTERVAL))
+        echo -n "."
+    done
+    echo ""
+    log_error "Timeout waiting for pod '$name' to reach [$phases]"
+    kubectl describe pod "$name" 2>/dev/null | tail -30 || true
+    return 1
 }
 
-test_provisioning_and_verification() {
-    log_test "=== Provisioning + verification ==="
+cleanup() {
+    log_info "Cleaning up blueprint resources..."
+    kubectl delete -f sandbox.yaml --ignore-not-found=true 2>/dev/null || true
+    kubectl delete -f sandbox-workload.yaml --ignore-not-found=true 2>/dev/null || true
+    kubectl delete -f workload.yaml --ignore-not-found=true 2>/dev/null || true
+    kubectl delete nodepool nested-virt --ignore-not-found=true 2>/dev/null || true
+    kubectl delete ec2nodeclass nested-virt --ignore-not-found=true 2>/dev/null || true
+    sleep 20
+}
 
-    cleanup
+# --- Test 1: Karpenter plumbing --------------------------------------------
+# Provisions an *8i* NodeClaim and verifies the pod sees vmx + /dev/kvm.
+# Uses the demo workload's own NodeClaim (matched via NodePool ownership) so
+# assertions are scoped to this blueprint, not to any other pool on the
+# cluster.
+test_karpenter_plumbing() {
+    log_test "=== Test 1: Karpenter plumbing (*8i* + vmx + /dev/kvm) ==="
+
     render_manifest
-
-    log_info "Applying rendered EC2NodeClass + NodePool..."
     kubectl apply -f /tmp/nested-virt-rendered.yaml
-
-    log_info "Applying demo workload..."
     kubectl apply -f workload.yaml
 
-    if ! wait_for_pod_ready "app=nested-virt-demo"; then
-        log_error "❌ FAILED: demo pod did not become Ready"
+    if ! wait_for_pod_ready "app=nested-virt-demo" "$TIMEOUT_NODE_READY"; then
+        log_error "FAILED: nested-virt-demo pod did not become Ready"
         return 1
     fi
 
-    # ---- Check 1: instance type family ----
-    local node
-    node=$(kubectl get pods -l app=nested-virt-demo -o jsonpath='{.items[0].spec.nodeName}')
-    local instance_type
+    local pod node instance_type instance_id nested flag
+    pod=$(kubectl get pod -l app=nested-virt-demo -o jsonpath='{.items[0].metadata.name}')
+    node=$(kubectl get pod "$pod" -o jsonpath='{.spec.nodeName}')
     instance_type=$(kubectl get node "$node" -o jsonpath='{.metadata.labels.node\.kubernetes\.io/instance-type}')
-    log_info "Karpenter provisioned instance type: $instance_type"
+
+    # Scope check: the node must be owned by *this* blueprint's NodePool.
+    local nodeclaim_pool
+    nodeclaim_pool=$(kubectl get nodeclaims -o jsonpath="{range .items[?(@.status.nodeName==\"$node\")]}{.metadata.labels['karpenter\.sh/nodepool']}{end}" 2>/dev/null || echo "")
+    if [ "$nodeclaim_pool" != "nested-virt" ]; then
+        log_error "FAILED: pod landed on node '$node' whose NodeClaim is owned by pool '$nodeclaim_pool' (expected nested-virt)"
+        return 1
+    fi
+    log_test "PASSED: pod landed on NodeClaim owned by nested-virt NodePool"
+
+    log_info "Instance type: $instance_type"
     case "$instance_type" in
         c8i*|m8i*|r8i*)
-            log_test "✅ PASSED: instance is from an *8i* family"
+            log_test "PASSED: instance is from an *8i* family"
             ;;
         *)
-            log_error "❌ FAILED: instance $instance_type is not from an *8i* family"
+            log_error "FAILED: instance $instance_type is not from an *8i* family"
             return 1
             ;;
     esac
 
-    # Run all remaining checks and accumulate result — don't fail-fast so
-    # readers see everything on one run.
-    local failures=0
-
-    # ---- Check 2 (informational): EC2 API CpuOptions.NestedVirtualization ----
-    # On *8i* families the Nitro System natively passes CPU virt extensions,
-    # so this field can be reported as None even when nested virt is working.
-    # The vmx + /dev/kvm checks below are the definitive proof.
-    local instance_id
+    # Informational: EC2 API CpuOptions. On *8i* the Nitro System passes CPU
+    # virt extensions natively, so this can be reported as None even when
+    # nested virt is working. The vmx + /dev/kvm checks below are the proof.
     instance_id=$(kubectl get node "$node" -o jsonpath='{.spec.providerID}' | awk -F/ '{print $NF}')
-    local nested
     nested=$(aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$instance_id" \
         --query 'Reservations[0].Instances[0].CpuOptions.NestedVirtualization' \
         --output text 2>/dev/null || echo "None")
-    log_info "EC2 CpuOptions.NestedVirtualization for instance $instance_id: $nested (informational)"
+    log_info "EC2 CpuOptions.NestedVirtualization for $instance_id: $nested (informational)"
 
-    # ---- Check 3: vmx or svm flag visible from inside the pod ----
-    local pod
-    pod=$(kubectl get pod -l app=nested-virt-demo -o jsonpath='{.items[0].metadata.name}')
-    local flag
+    local failures=0
     flag=$(kubectl exec "$pod" -- grep -om1 'vmx\|svm' /proc/cpuinfo 2>/dev/null || echo "")
     if [ -n "$flag" ]; then
-        log_test "✅ PASSED: pod sees CPU virt extension: $flag"
+        log_test "PASSED: pod sees CPU virt extension: $flag"
     else
-        log_error "❌ FAILED: no vmx or svm flag in /proc/cpuinfo from the pod"
+        log_error "FAILED: no vmx or svm flag in /proc/cpuinfo"
         failures=$((failures + 1))
     fi
 
-    # ---- Check 4: /dev/kvm exists inside the pod ----
     if kubectl exec "$pod" -- test -e /dev/kvm 2>/dev/null; then
-        log_test "✅ PASSED: /dev/kvm is present inside the pod"
+        log_test "PASSED: /dev/kvm is present inside the pod"
     else
-        log_error "❌ FAILED: /dev/kvm not present inside the pod"
+        log_error "FAILED: /dev/kvm not present inside the pod"
         failures=$((failures + 1))
     fi
 
-    if [ $failures -eq 0 ]; then
-        return 0
-    else
+    if [ $failures -gt 0 ]; then
         log_error "$failures verification check(s) failed"
         return 1
     fi
+    return 0
+}
+
+# --- Test 2: Kata MicroVM boundary -----------------------------------------
+# Runs a pod via RuntimeClass kata-qemu-runtime-rs and asserts the guest
+# kernel differs from the host node's kernel. Different kernels = different
+# VMs = the MicroVM boundary is real.
+test_kata_microvm() {
+    log_test "=== Test 2: Kata MicroVM boundary (guest kernel != host kernel) ==="
+
+    kubectl apply -f sandbox-workload.yaml
+
+    # kata-verify has restartPolicy=Never so it goes Running then Succeeded.
+    if ! wait_for_pod_phase "kata-verify" "Running Succeeded" "$TIMEOUT_NODE_READY"; then
+        log_error "FAILED: kata-verify pod did not run"
+        return 1
+    fi
+
+    # Scope check: kata-verify must be on a nested-virt NodePool NodeClaim.
+    local node nodeclaim_pool
+    node=$(kubectl get pod kata-verify -o jsonpath='{.spec.nodeName}')
+    nodeclaim_pool=$(kubectl get nodeclaims -o jsonpath="{range .items[?(@.status.nodeName==\"$node\")]}{.metadata.labels['karpenter\.sh/nodepool']}{end}" 2>/dev/null || echo "")
+    if [ "$nodeclaim_pool" != "nested-virt" ]; then
+        log_error "FAILED: kata-verify landed on '$node' owned by pool '$nodeclaim_pool' (expected nested-virt)"
+        return 1
+    fi
+
+    # Host kernel: read from a non-Kata pod that sits directly on the same
+    # node. workload.yaml's nested-virt-demo pod fits — it's privileged, not
+    # wrapped in Kata. This gives us the host kernel identity without needing
+    # SSH onto the node.
+    local host_kernel
+    host_kernel=$(kubectl exec deploy/nested-virt-demo -- uname -r 2>/dev/null | tr -d '\r\n' || echo "")
+    if [ -z "$host_kernel" ]; then
+        log_error "FAILED: could not read host kernel from nested-virt-demo pod"
+        return 1
+    fi
+    log_info "Host kernel (from non-Kata pod on nested-virt node): $host_kernel"
+
+    # Guest kernel: kata-verify's stdout, which runs `uname -a`.
+    local guest_kernel
+    guest_kernel=$(kubectl logs kata-verify 2>/dev/null | grep -oE 'Linux [^ ]+ [^ ]+' | awk '{print $3}' | head -1)
+    if [ -z "$guest_kernel" ]; then
+        log_error "FAILED: could not parse guest kernel from kata-verify logs"
+        kubectl logs kata-verify 2>/dev/null | tail -20 || true
+        return 1
+    fi
+    log_info "Guest kernel (from inside Kata MicroVM):             $guest_kernel"
+
+    if [ "$host_kernel" = "$guest_kernel" ]; then
+        log_error "FAILED: guest kernel == host kernel; Kata isn't wrapping the pod"
+        return 1
+    fi
+    log_test "PASSED: guest kernel differs from host kernel — MicroVM boundary confirmed"
+    return 0
+}
+
+# --- Test 3: Agent sandbox demo --------------------------------------------
+# Deploys the sandbox Deployment, POSTs a snippet of Python to /exec, and
+# checks that the kernel reported in the response is the Kata guest kernel
+# (i.e. not the host kernel).
+test_sandbox_exec() {
+    log_test "=== Test 3: Agent sandbox exec (POSTed code runs inside MicroVM) ==="
+
+    kubectl apply -f sandbox.yaml
+    if ! wait_for_pod_ready "app=sandbox" "$TIMEOUT_NODE_READY"; then
+        log_error "FAILED: sandbox pod did not become Ready"
+        return 1
+    fi
+
+    # Scope check: the sandbox pod must be on a nested-virt NodeClaim.
+    local sandbox_pod node nodeclaim_pool
+    sandbox_pod=$(kubectl get pod -l app=sandbox -o jsonpath='{.items[0].metadata.name}')
+    node=$(kubectl get pod "$sandbox_pod" -o jsonpath='{.spec.nodeName}')
+    nodeclaim_pool=$(kubectl get nodeclaims -o jsonpath="{range .items[?(@.status.nodeName==\"$node\")]}{.metadata.labels['karpenter\.sh/nodepool']}{end}" 2>/dev/null || echo "")
+    if [ "$nodeclaim_pool" != "nested-virt" ]; then
+        log_error "FAILED: sandbox pod landed on '$node' owned by pool '$nodeclaim_pool' (expected nested-virt)"
+        return 1
+    fi
+
+    # Fire a POST from inside a pod on the cluster. Using `kubectl exec` on
+    # the sandbox pod itself with a stdlib urllib call avoids the
+    # `kubectl run --rm -i` pattern (which is unreliable in non-TTY shells)
+    # and doesn't need a second image with curl baked in. The sandbox
+    # container is python:3.12-slim, so urllib is available.
+    log_info "Calling POST /exec against sandbox service..."
+    local resp
+    resp=$(kubectl exec "$sandbox_pod" -- python3 -c "
+import urllib.request, json
+req = urllib.request.Request(
+    'http://localhost:8080/exec',
+    data=json.dumps({'code': 'import os; print(os.uname().release)'}).encode(),
+    headers={'Content-Type': 'application/json'},
+)
+print(urllib.request.urlopen(req, timeout=10).read().decode())
+" 2>/dev/null || echo "")
+
+    if [ -z "$resp" ]; then
+        log_error "FAILED: sandbox /exec returned no response"
+        return 1
+    fi
+    log_info "Sandbox response: $resp"
+
+    # Parse the exec'd code's stdout — that's the kernel the *guest* sees.
+    local exec_kernel
+    exec_kernel=$(echo "$resp" | grep -oE '"stdout":[[:space:]]*"[^"\\]*' | head -1 | sed -E 's/.*"stdout":[[:space:]]*"([^\\]*).*/\1/' | tr -d '\r\n')
+    if [ -z "$exec_kernel" ]; then
+        log_error "FAILED: could not parse stdout kernel from sandbox response"
+        return 1
+    fi
+
+    local host_kernel
+    host_kernel=$(kubectl exec deploy/nested-virt-demo -- uname -r 2>/dev/null | tr -d '\r\n' || echo "")
+
+    log_info "Kernel reported by exec'd code inside sandbox: $exec_kernel"
+    log_info "Host kernel on nested-virt node:               $host_kernel"
+
+    if [ "$exec_kernel" = "$host_kernel" ]; then
+        log_error "FAILED: exec'd code sees the host kernel; sandbox is not isolated"
+        return 1
+    fi
+    log_test "PASSED: POSTed code executed inside the MicroVM (kernel differs from host)"
+    return 0
 }
 
 main() {
     local exit_code=0
 
     check_prerequisites
-    test_provisioning_and_verification || exit_code=1
+    test_karpenter_plumbing || exit_code=1
+    if [ $exit_code -eq 0 ]; then
+        test_kata_microvm || exit_code=1
+    fi
+    if [ $exit_code -eq 0 ]; then
+        test_sandbox_exec || exit_code=1
+    fi
     cleanup
 
     if [ $exit_code -eq 0 ]; then

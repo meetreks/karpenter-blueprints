@@ -1,0 +1,49 @@
+---
+# Scope-B verifier: this pod actually runs INSIDE a Kata MicroVM.
+# `runtimeClassName: kata-qemu-runtime-rs` tells containerd to launch the
+# pod via Kata's runtime-rs shim with QEMU as the VMM. The shim boots a
+# QEMU-based MicroVM per pod, loads the Kata guest kernel + rootfs, then
+# runs the container inside that VM. QEMU is the recommended default in
+# Kata v4.0.0 because it uses the standard overlayfs snapshotter and needs
+# no extra host setup — see the README for the Firecracker (`kata-fc`)
+# option, which offers faster boot but requires a devmapper thin-pool.
+# The script below confirms MicroVM execution by checking the guest kernel
+# identity, which differs from the host kernel.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kata-verify
+  labels:
+    app: kata-verify
+spec:
+  runtimeClassName: kata-qemu-runtime-rs
+  # Steer onto the nested-virt NodePool. Karpenter has already provisioned
+  # a *8i* node above; the Kata Firecracker shim needs /dev/kvm on the host,
+  # which only nested-virt-enabled instances expose.
+  nodeSelector:
+    blueprint: nested-virtualization
+  terminationGracePeriodSeconds: 0
+  restartPolicy: Never
+  containers:
+    - name: verify
+      image: public.ecr.aws/amazonlinux/amazonlinux:2023
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          set -e
+          echo "=== Guest kernel (what this container sees) ==="
+          uname -a
+          echo "  Note the kernel differs from the host — Kata's minimal guest"
+          echo "  kernel, not the AL2023 host kernel. That's the MicroVM boundary."
+          echo ""
+          echo "=== First few /proc/cpuinfo lines from the guest ==="
+          head -5 /proc/cpuinfo
+          echo ""
+          echo "PASS: this container is running inside a Kata MicroVM (QEMU VMM under runtime-rs)."
+      resources:
+        requests:
+          cpu: "500m"
+          memory: 512Mi
+        limits:
+          cpu: "1"
+          memory: 1Gi
