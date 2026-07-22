@@ -166,7 +166,7 @@ Here's the list of blueprints we have so far:
 | [Customizing nodes with your own User Data automation](/blueprints/userdata/) | ✅ | ❌ |
 | [Protecting batch jobs during the consolidation process](/blueprints/batch-jobs/) | ✅ | ✅ |
 | [NodePool Disruption Budgets](/blueprints/disruption-budgets/) | ✅ | ✅ |
-| [Balanced Consolidation Policy](/blueprints/balanced-consolidation/) | ✅ | ✅ |
+| [Balanced Consolidation Policy](/blueprints/balanced-consolidation/) | ✅ | ❌ |
 | [Deploy an NVIDIA GPU workload](/blueprints/nvidia-gpu-workload/) | ✅ | ✅ |
 | [Accelerating image pull time using SOCI parallel mode](/blueprints/soci-snapshotter/) | ✅ | ✅ |
 | [Reserve node capacity for spiky workloads](/blueprints/node-reserved-headroom/) | ✅ | ✅ |
