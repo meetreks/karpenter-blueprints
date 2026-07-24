@@ -357,6 +357,46 @@ print(urllib.request.urlopen(req, timeout=10).read().decode())
         return 1
     fi
     log_test "PASSED: POSTed code executed inside the MicroVM (kernel differs from host)"
+
+    # --- Sub-test: destructive rm inside the sandbox ---
+    # Mirror the README's `== destructive rm ==` example. POST a single
+    # Python snippet that creates a marker file, deletes it with `rm -rf`,
+    # and reports the before/after existence. If we get back
+    # `before=True after=False` with exit_code=0, the rm executed inside
+    # the sandbox's MicroVM filesystem. The host node's /tmp is unaffected
+    # because it's on the other side of the VM boundary.
+    log_info "Running destructive rm sub-test via sandbox /exec..."
+
+    local destructive_code='p="/tmp/sandbox-rm-marker"; open(p,"w").write("present"); import os, subprocess; before=os.path.exists(p); subprocess.run(["rm","-rf",p], check=False); after=os.path.exists(p); print(f"before={before} after={after}")'
+    local rm_resp
+    rm_resp=$(kubectl exec "$sandbox_pod" -- python3 -c "
+import urllib.request, json
+req = urllib.request.Request(
+    'http://localhost:8080/exec',
+    data=json.dumps({'code': '''$destructive_code'''}).encode(),
+    headers={'Content-Type': 'application/json'},
+)
+print(urllib.request.urlopen(req, timeout=15).read().decode())
+" 2>/dev/null || echo "")
+
+    if [ -z "$rm_resp" ]; then
+        log_error "FAILED: destructive rm sub-test /exec returned no response"
+        return 1
+    fi
+    log_info "Destructive rm sub-test response: $rm_resp"
+
+    # The response's stdout should contain "before=True after=False".
+    # exit_code must be 0 and stderr empty.
+    if ! echo "$rm_resp" | grep -q '"exit_code":[[:space:]]*0'; then
+        log_error "FAILED: destructive rm returned non-zero exit_code"
+        return 1
+    fi
+    if ! echo "$rm_resp" | grep -q 'before=True[[:space:]]*after=False'; then
+        log_error "FAILED: sandbox filesystem not mutated as expected — response was: $rm_resp"
+        return 1
+    fi
+    log_test "PASSED: destructive rm ran inside the sandbox MicroVM (marker created, then removed)"
+
     return 0
 }
 

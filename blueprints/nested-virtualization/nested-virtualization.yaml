@@ -17,8 +17,9 @@ spec:
   # cpuOptions.nestedVirtualization is a Karpenter v1.13+ field. Karpenter
   # forwards this into the launched instance's CpuOptions and additionally
   # rejects any instance type whose ProcessorInfo.SupportedFeatures does not
-  # include "nested-virtualization". As of this blueprint, only the *8i*
-  # families (c8i, m8i, r8i and -flex variants) report the feature.
+  # include "nested-virtualization". The set of supporting families is
+  # maintained by EC2; see the AWS docs for the current list:
+  # https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/amazon-ec2-nested-virtualization.html
   cpuOptions:
     nestedVirtualization: enabled
   tags:
@@ -44,12 +45,29 @@ spec:
       # Explicit family pinning is not strictly required — Karpenter's
       # NestedVirtualizationFilter would narrow candidates for us — but
       # being explicit makes the blueprint's intent clear to readers and
-      # keeps the pool from drifting onto a future non-8i family that
-      # happens to also report the feature.
+      # mirrors the currently supported set from the AWS docs:
+      # https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/amazon-ec2-nested-virtualization.html
+      # Update this list if AWS adds more families.
       requirements:
         - key: karpenter.k8s.aws/instance-family
           operator: In
-          values: ["c8i", "m8i", "r8i"]
+          values:
+            - c8i
+            - c8id
+            - c8i-flex
+            - m8i
+            - m8id
+            - m8i-flex
+            - r8i
+            - r8id
+            - r8i-flex
+            - x8i
+            - c7i
+            - c7i-flex
+            - m7i
+            - m7i-flex
+            - r7i
+            - i7i
         - key: kubernetes.io/arch
           operator: In
           values: ["amd64"]
