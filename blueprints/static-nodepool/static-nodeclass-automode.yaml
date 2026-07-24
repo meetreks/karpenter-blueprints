@@ -3,6 +3,7 @@ kind: NodeClass
 metadata:
   name: gpu-static
 spec:
+  role: "<<KARPENTER_NODE_IAM_ROLE_NAME>>"
   securityGroupSelectorTerms:
   - tags:
       karpenter.sh/discovery: <<CLUSTER_NAME>>
@@ -11,3 +12,16 @@ spec:
       karpenter.sh/discovery: <<CLUSTER_NAME>>
   ephemeralStorage:
     size: "100Gi"
+  # Attach a standard primary ENI plus a secondary EFA-only ENI for
+  # high-throughput inter-node communication (RDMA). The efa-only
+  # interface doesn't consume an IP in the VPC. This block is supported
+  # on Auto Mode as of the July 2026 EFA + Placement Groups launch:
+  # https://aws.amazon.com/about-aws/whats-new/2026/07/amazon-eks-efa-placement-groups/
+  advancedNetworking:
+    networkInterfaces:
+    - deviceIndex: 0
+      networkCardIndex: 0
+      interfaceType: interface
+    - deviceIndex: 1
+      networkCardIndex: 0
+      interfaceType: efa-only

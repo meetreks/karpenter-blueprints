@@ -104,6 +104,13 @@ You might use placement groups to co-locate compute for performance, or spread f
 
 > **NOTE**: The placement group must already exist before applying the EC2NodeClass — Karpenter does not create placement groups. Placement group support requires Karpenter v1.11.0+. See the [Karpenter EC2NodeClass documentation](https://karpenter.sh/docs/concepts/nodeclasses/#specplacementgroupselector) for more information.
 
+> **Placement group gotchas** — apply the same way on both OSS Karpenter and EKS Auto Mode:
+>
+> - **Cluster PG pins the AZ on first launch.** Once the first node lands, subsequent nodes in that PG must be in the same AZ. Pin `topology.kubernetes.io/zone` in your NodePool requirements or expect racy scale-ups when a different AZ is chosen.
+> - **Spread PG caps at 7 instances per AZ per group.** At the cap, Karpenter's drift replacement is blocked. Use `consolidationPolicy: WhenEmpty` on the NodePool so an outgoing node is fully drained before a replacement is attempted.
+> - **Pods don't inherit PG membership.** Consolidation can schedule pods onto nodes outside the PG. If the pods must live inside it, express that with a `nodeSelector` (e.g. matching the NodePool label) or a `topologySpreadConstraint`.
+> - **Deleted PGs drift silently.** `placementGroupSelector` is validated at admission, but the PG's continued existence is only checked at node-launch time. Delete a PG a NodeClass still points at and Karpenter will keep trying to use it, then fail at launch.
+
 #### Capacity reservations
 
 If using capacity via ODCRs or Capacity Blocks, add `capacityReservationSelectorTerms` to target it using id or tags:
@@ -221,23 +228,27 @@ gpu-static               gpu-static               1       True    48s
 
 EKS Auto Mode supports static capacity NodePools with the same `spec.replicas` field — see the [Static Capacity Node Pools in EKS Auto Mode](https://docs.aws.amazon.com/eks/latest/userguide/auto-static-capacity.html) documentation. **No `StaticCapacity` feature gate flip is needed** — the managed Karpenter in Auto Mode exposes this directly.
 
-The Auto Mode NodeClass collapses to a minimal form: no `amiSelectorTerms`, no `role`, no `blockDeviceMappings`, no `instanceStorePolicy`, and no `networkInterfaces`. EFA, ENA, and instance store policy are managed by Auto Mode. NVIDIA drivers and the device plugin are also included automatically — no extra install needed.
+As of the [July 2026 EFA and Placement Groups launch](https://aws.amazon.com/about-aws/whats-new/2026/07/amazon-eks-efa-placement-groups/), the Auto Mode `NodeClass` also exposes EFA network interfaces and placement-group configuration as first-class fields. The shipped `static-nodeclass-automode.yaml` sets a primary `interface` ENI plus a secondary `efa-only` ENI under `spec.advancedNetworking.networkInterfaces`, and the paired `static-nodepool-automode.yaml` carries the `vpc.amazonaws.com/efa.present: "true"` label so pods that request EFA can schedule onto it. NVIDIA drivers and the device plugin are still bundled by Auto Mode, so no extra install is needed.
 
-To deploy on Auto Mode, replace `<<CLUSTER_NAME>>` and apply:
+To deploy on Auto Mode, substitute the placeholders and apply:
 
 ```sh
-sed -i "s/<<CLUSTER_NAME>>/$CLUSTER_NAME/g" static-nodeclass-automode.yaml
+sed -i \
+  -e "s/<<CLUSTER_NAME>>/$CLUSTER_NAME/g" \
+  -e "s/<<KARPENTER_NODE_IAM_ROLE_NAME>>/$KARPENTER_NODE_IAM_ROLE_NAME/g" \
+  static-nodeclass-automode.yaml
 kubectl apply -f static-nodeclass-automode.yaml
 kubectl apply -f static-nodepool-automode.yaml
 ```
 
-Differences from the OSS version:
+Key differences from the OSS version:
 - `NodeClass` (`eks.amazonaws.com/v1`) replaces `EC2NodeClass` (`karpenter.k8s.aws/v1`)
-- `networkInterfaces`, `instanceStorePolicy`, `amiSelectorTerms`, `role`, and `blockDeviceMappings` are removed — Auto Mode manages these
-- The `vpc.amazonaws.com/efa.present` label is dropped from the NodePool template (Auto Mode handles EFA differently — see the [EFA on Auto Mode docs](https://docs.aws.amazon.com/eks/latest/userguide/manage-efa.html))
+- `amiSelectorTerms` and `blockDeviceMappings` are not exposed — Auto Mode picks the AMI (Bottlerocket EKS Auto for CPU pools, Bottlerocket EKS Auto Nvidia for GPU pools) and manages block devices
+- `networkInterfaces` moves under `advancedNetworking.networkInterfaces` on the Auto Mode `NodeClass` — same primary + `efa-only` shape as the OSS `EC2NodeClass`
+- `placementGroupSelector` is available as a first-class field, syntax identical to OSS (`name:` or `id:`); the [placement group gotchas](#placement-groups) above apply on Auto Mode too
+- `capacityReservationSelectorTerms` is also supported first-class — see the [Capacity reservations](#capacity-reservations) section above for the syntax; the same NodePool `karpenter.sh/capacity-type: reserved` requirement applies
+- `instanceStorePolicy` is not exposed — Auto Mode manages the instance-store policy internally
 - No `StaticCapacity` feature gate flip — `spec.replicas` is supported natively
-
-The OSS blueprint demonstrates `placementGroupSelector` and `capacityReservationSelectorTerms` for ODCR / Capacity Blocks. Auto Mode handles capacity reservations through different mechanisms — refer to the [EKS Auto Mode documentation](https://docs.aws.amazon.com/eks/latest/userguide/automode.html) for the current support matrix.
 
 If you are **not** using the `cluster/automode/` Terraform template, configure the Access Entry manually:
 
@@ -254,6 +265,12 @@ aws eks associate-access-policy \
   --access-scope type=cluster
 ```
 </details>
+
+## Sample workloads
+
+This blueprint provisions the node substrate — the actual workload is out of scope because it varies by model, dataset, and framework. Common fits for a static pool of accelerated nodes with EFA and a placement group are distributed training (PyTorch DDP or Megatron-style multi-node runs) and long-running model inference (vLLM, TGI) where cold-start churn on autoscaled pools would hurt latency.
+
+Actually flexing the EFA fabric at runtime (rather than just declaring it in the NodeClass) is beyond what this blueprint covers — training runs are typically hours long and their setup lives with the ML sample, not with the compute plumbing. For a lightweight way to verify the fabric on its own, the [NVIDIA NCCL tests](https://github.com/NVIDIA/nccl-tests) repository is the standard benchmark; the [AWS samples on GitHub](https://github.com/aws-samples) have end-to-end distributed training examples that layer on top of a pool like the one this blueprint sets up.
 
 ## Clean-up
 

@@ -11,6 +11,7 @@ spec:
       labels:
         capacity-type: gpu-static
         nvidia.com/gpu.present: "true"
+        vpc.amazonaws.com/efa.present: "true"
     spec:
       nodeClassRef:
         group: eks.amazonaws.com
