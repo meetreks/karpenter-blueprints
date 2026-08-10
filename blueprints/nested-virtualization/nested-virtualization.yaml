@@ -34,16 +34,26 @@ spec:
     metadata:
       labels:
         blueprint: nested-virtualization
-        # kata-deploy DaemonSet targets nodes with this label to install the
-        # Kata Containers runtime + register the kata-* RuntimeClasses.
+        # The kata-deploy DaemonSet is scoped to nodes with this label (via
+        # the nodeSelector passed at helm install, see README step 2). It
+        # installs the Kata runtime and containerd config on these nodes only.
         katacontainers.io/kata-runtime: "true"
     spec:
       nodeClassRef:
         group: karpenter.k8s.aws
         kind: EC2NodeClass
         name: nested-virt
-      # Explicit family pinning is not strictly required — Karpenter's
-      # NestedVirtualizationFilter would narrow candidates for us — but
+      # Keeps workloads off a freshly provisioned node until kata-deploy has
+      # finished installing the runtime. kata-deploy removes this taint as its
+      # final install step (the chart's startupTaints value, README step 2),
+      # closing the race where a Kata pod is scheduled before the runtime
+      # binaries exist. Karpenter still provisions nodes for pods that don't
+      # tolerate startup taints; the pods just wait for the taint's removal.
+      startupTaints:
+        - key: katacontainers.io/kata-runtime
+          effect: NoSchedule
+      # Explicit family pinning is not strictly required (Karpenter's
+      # NestedVirtualizationFilter would narrow candidates for us), but
       # being explicit makes the blueprint's intent clear to readers and
       # mirrors the currently supported set from the AWS docs:
       # https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/amazon-ec2-nested-virtualization.html

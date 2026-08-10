@@ -3,18 +3,18 @@
 #
 # Verifies three things end-to-end:
 #
-#   Test 1 (Karpenter plumbing): Karpenter provisions an *8i* NodeClaim from
-#     the nested-virt NodePool, EC2 reports CpuOptions on the launched
-#     instance, and the demo pod sees the vmx flag + /dev/kvm.
+#   Test 1 (Karpenter plumbing): Karpenter provisions a nested-virt-capable
+#     NodeClaim from the nested-virt NodePool, EC2 reports CpuOptions on the
+#     launched instance, and the demo pod sees the vmx flag + /dev/kvm.
 #
 #   Test 2 (Kata MicroVM): the kata-verify pod runs via RuntimeClass
 #     kata-qemu-runtime-rs and reports a guest kernel version that differs
-#     from the host node's kernel — proof that Kata is actively wrapping the
+#     from the host node's kernel, proof that Kata is actively wrapping the
 #     pod in a MicroVM, not just installed.
 #
 #   Test 3 (Agent sandbox demo): the sandbox Deployment comes up on Kata,
 #     accepts POST /exec, and the kernel reported in its JSON response also
-#     differs from the host kernel — proof that arbitrary user-supplied code
+#     differs from the host kernel, proof that arbitrary user-supplied code
 #     lands inside the MicroVM boundary.
 #
 # All assertions are scoped to this blueprint's own resources (label
@@ -84,8 +84,8 @@ check_prerequisites() {
     # than reporting a misleading failure inside the kata-verify pod.
     if ! kubectl get runtimeclass kata-qemu-runtime-rs &> /dev/null; then
         log_error "RuntimeClass 'kata-qemu-runtime-rs' not found on the cluster."
-        log_error "Install Kata Containers before running the test — see README step 2:"
-        log_error "  helm install kata-deploy oci://ghcr.io/kata-containers/kata-deploy-charts/kata-deploy --version 4.0.0 -n kube-system"
+        log_error "Install Kata Containers first. See README step 2 for the full helm"
+        log_error "install command (it scopes the DaemonSet to this blueprint's nodes)."
         exit 1
     fi
 
@@ -156,6 +156,9 @@ wait_for_pod_phase() {
 
 cleanup() {
     log_info "Cleaning up blueprint resources..."
+    # Deliberately does NOT uninstall the kata-deploy Helm release: Kata is a
+    # prerequisite this script checks for but doesn't own (see README Cleanup
+    # for the helm uninstall step).
     kubectl delete -f sandbox.yaml --ignore-not-found=true 2>/dev/null || true
     kubectl delete -f sandbox-workload.yaml --ignore-not-found=true 2>/dev/null || true
     kubectl delete -f workload.yaml --ignore-not-found=true 2>/dev/null || true
@@ -165,12 +168,12 @@ cleanup() {
 }
 
 # --- Test 1: Karpenter plumbing --------------------------------------------
-# Provisions an *8i* NodeClaim and verifies the pod sees vmx + /dev/kvm.
-# Uses the demo workload's own NodeClaim (matched via NodePool ownership) so
-# assertions are scoped to this blueprint, not to any other pool on the
-# cluster.
+# Provisions a nested-virt-capable NodeClaim and verifies the pod sees
+# vmx + /dev/kvm. Uses the demo workload's own NodeClaim (matched via
+# NodePool ownership) so assertions are scoped to this blueprint, not to
+# any other pool on the cluster.
 test_karpenter_plumbing() {
-    log_test "=== Test 1: Karpenter plumbing (*8i* + vmx + /dev/kvm) ==="
+    log_test "=== Test 1: Karpenter plumbing (nested-virt family + vmx + /dev/kvm) ==="
 
     render_manifest
     kubectl apply -f /tmp/nested-virt-rendered.yaml
@@ -196,12 +199,14 @@ test_karpenter_plumbing() {
     log_test "PASSED: pod landed on NodeClaim owned by nested-virt NodePool"
 
     log_info "Instance type: $instance_type"
+    # Must match the instance-family list in nested-virtualization.yaml's
+    # NodePool. Keep these two in sync if AWS adds more nested-virt families.
     case "$instance_type" in
-        c8i*|m8i*|r8i*)
-            log_test "PASSED: instance is from an *8i* family"
+        c8i*|m8i*|r8i*|x8i*|c7i*|m7i*|r7i*|i7i*)
+            log_test "PASSED: instance is from a nested-virt-capable family"
             ;;
         *)
-            log_error "FAILED: instance $instance_type is not from an *8i* family"
+            log_error "FAILED: instance $instance_type is not from a nested-virt-capable family"
             return 1
             ;;
     esac
@@ -263,7 +268,7 @@ test_kata_microvm() {
     fi
 
     # Host kernel: read from a non-Kata pod that sits directly on the same
-    # node. workload.yaml's nested-virt-demo pod fits — it's privileged, not
+    # node. workload.yaml's nested-virt-demo pod fits: it's privileged, not
     # wrapped in Kata. This gives us the host kernel identity without needing
     # SSH onto the node.
     local host_kernel
@@ -288,7 +293,7 @@ test_kata_microvm() {
         log_error "FAILED: guest kernel == host kernel; Kata isn't wrapping the pod"
         return 1
     fi
-    log_test "PASSED: guest kernel differs from host kernel — MicroVM boundary confirmed"
+    log_test "PASSED: guest kernel differs from host kernel, MicroVM boundary confirmed"
     return 0
 }
 
@@ -338,7 +343,7 @@ print(urllib.request.urlopen(req, timeout=10).read().decode())
     fi
     log_info "Sandbox response: $resp"
 
-    # Parse the exec'd code's stdout — that's the kernel the *guest* sees.
+    # Parse the exec'd code's stdout. That's the kernel the *guest* sees.
     local exec_kernel
     exec_kernel=$(echo "$resp" | grep -oE '"stdout":[[:space:]]*"[^"\\]*' | head -1 | sed -E 's/.*"stdout":[[:space:]]*"([^\\]*).*/\1/' | tr -d '\r\n')
     if [ -z "$exec_kernel" ]; then
@@ -392,7 +397,7 @@ print(urllib.request.urlopen(req, timeout=15).read().decode())
         return 1
     fi
     if ! echo "$rm_resp" | grep -q 'before=True[[:space:]]*after=False'; then
-        log_error "FAILED: sandbox filesystem not mutated as expected — response was: $rm_resp"
+        log_error "FAILED: sandbox filesystem not mutated as expected. Response was: $rm_resp"
         return 1
     fi
     log_test "PASSED: destructive rm ran inside the sandbox MicroVM (marker created, then removed)"

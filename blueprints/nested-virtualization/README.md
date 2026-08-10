@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Some workloads need to run a lightweight virtual machine inside a pod — Kata Containers as an isolation runtime for agent tool sandboxes, KVM-based CI runners that build test images, KubeVirt to host legacy VMs on Kubernetes, or nested KVM in a security-scanning environment. All of these require the underlying EC2 instance to have **nested virtualization** enabled at launch time. Historically this meant custom launch templates and manual node lifecycle management on `.metal` sizes.
+Some workloads need to run a lightweight virtual machine inside a pod: Kata Containers as an isolation runtime for agent tool sandboxes, KVM-based CI runners that build test images, KubeVirt to host legacy VMs on Kubernetes, or nested KVM in a security-scanning environment. All of these require the underlying EC2 instance to have **nested virtualization** enabled at launch time. Historically this meant custom launch templates and manual node lifecycle management on `.metal` sizes.
 
 Karpenter [v1.13.0](https://github.com/aws/karpenter-provider-aws/releases/tag/v1.13.0) (June 2026) added a first-class field on `EC2NodeClass`:
 
@@ -12,14 +12,14 @@ spec:
     nestedVirtualization: enabled   # or "disabled"
 ```
 
-Karpenter forwards this into the instance's `CpuOptions` at launch and additionally filters candidate instance types to only those whose EC2 `ProcessorInfo.SupportedFeatures` reports `nested-virtualization`. See the [AWS EC2 nested virtualization docs](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/amazon-ec2-nested-virtualization.html) for the currently supported set — a mix of `*7i` and `*8i` families including `c7i-flex`, `m8i-flex`, `x8i`, `i7i` and more. The NodePool in this blueprint mirrors that list; update it if AWS adds more families.
+Karpenter forwards this into the instance's `CpuOptions` at launch and additionally filters candidate instance types to only those whose EC2 `ProcessorInfo.SupportedFeatures` reports `nested-virtualization`. See the [AWS EC2 nested virtualization docs](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/amazon-ec2-nested-virtualization.html) for the currently supported set, a mix of `*7i` and `*8i` families including `c7i-flex`, `m8i-flex`, `x8i`, `i7i` and more. The NodePool in this blueprint mirrors that list. Update it if AWS adds more families.
 
 The blueprint has two parts:
 
-1. **The Karpenter plumbing** — a `nested-virt` `EC2NodeClass` + `NodePool` that Karpenter uses to provision nested-virt-capable instances on demand.
-2. **A real-workload demo** — a small Python-exec sandbox that runs each POSTed script inside its own MicroVM (its own kernel, filesystem and network namespace). This is the canonical agent-tool-sandbox pattern; the demo proves the plumbing works end-to-end.
+1. **The Karpenter plumbing**: a `nested-virt` `EC2NodeClass` + `NodePool` that Karpenter uses to provision nested-virt-capable instances on demand.
+2. **A real-workload demo**: a small Python-exec sandbox that runs each POSTed script inside its own MicroVM (its own kernel, filesystem and network namespace). This is the canonical agent-tool-sandbox pattern, and the demo proves the plumbing works end-to-end.
 
-We use [Kata Containers](https://katacontainers.io/) as the MicroVM runtime for the demo. [KubeVirt](https://kubevirt.io/) and [Confidential Containers](https://confidentialcontainers.org/) are equivalent choices on the same nested-virt substrate — Kata is used here mainly because it has the shortest install path for a blueprint demo, no strong preference over the alternatives.
+We use [Kata Containers](https://katacontainers.io/) as the MicroVM runtime for the demo. [KubeVirt](https://kubevirt.io/) and [Confidential Containers](https://confidentialcontainers.org/) are equivalent choices on the same nested-virt substrate. Kata is used here mainly because it has the shortest install path for a blueprint demo, with no strong preference over the alternatives.
 
 ## When to use this blueprint (and when not to)
 
@@ -36,7 +36,7 @@ If you're greenfielding an agent that runs untrusted code, look at Lambda MicroV
 ## Requirements
 
 - An EKS cluster running **self-managed Karpenter v1.13 or later**. Earlier versions do not expose `cpuOptions` on the EC2NodeClass CRD.
-- **This blueprint is not supported on EKS Auto Mode.** Auto Mode's `NodeClass` (`eks.amazonaws.com/v1`) does not expose a `cpuOptions` field. If you want nested virtualization on Auto Mode, you'd need to run OSS Karpenter alongside — a supported but atypical configuration.
+- **This blueprint is not supported on EKS Auto Mode.** Auto Mode's `NodeClass` (`eks.amazonaws.com/v1`) does not expose a `cpuOptions` field. If you want nested virtualization on Auto Mode, you'd need to run OSS Karpenter alongside, a supported but atypical configuration.
 - `helm` v3.
 - Cluster in a region where at least one of the supported nested-virt families is available. Check the AWS EC2 nested virtualization docs (linked above) for current regional coverage.
 
@@ -61,10 +61,11 @@ kubectl get nodepool nested-virt
 
 The pool reports `0` nodes because nothing has been scheduled onto it yet. Nodes are provisioned on demand when the first pod that matches lands in the scheduler.
 
-Two things worth noticing when you look at `nested-virtualization.yaml`:
+Three things worth noticing when you look at `nested-virtualization.yaml`:
 
 - **The `cpuOptions` block does two jobs at once.** It sets `NestedVirtualization=enabled` on the launched instance's `CpuOptions` *and* it tells Karpenter's `NestedVirtualizationFilter` to reject any candidate instance type that doesn't support the feature. One field controls both admission and the runtime bit.
 - **The `requirements` list mirrors the [AWS-supported families](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/amazon-ec2-nested-virtualization.html) explicitly.** Karpenter's filter would narrow candidates for us regardless, but listing the families keeps the intent clear and makes it easy to spot when AWS's list drifts.
+- **The `startupTaints` entry pairs with the Kata install in step 2.** Fresh nodes come up tainted so Kata workloads can't land before the runtime is installed. kata-deploy removes the taint once the install completes.
 
 ### 2. Kata Containers via the upstream Helm chart
 
@@ -75,27 +76,43 @@ KATA_VERSION=4.0.0
 helm install kata-deploy \
   oci://ghcr.io/kata-containers/kata-deploy-charts/kata-deploy \
   --version "$KATA_VERSION" \
-  -n kube-system
+  -n kube-system \
+  -f - <<'EOF'
+nodeSelector:
+  katacontainers.io/kata-runtime: "true"
+tolerations:
+  - key: katacontainers.io/kata-runtime
+    operator: Exists
+    effect: NoSchedule
+startupTaints:
+  - "katacontainers.io/kata-runtime:NoSchedule"
+EOF
 ```
+
+The three values work together with the NodePool in `nested-virtualization.yaml`:
+
+- `nodeSelector` scopes the DaemonSet to nodes labeled `katacontainers.io/kata-runtime: "true"`, which is exactly the label this blueprint's NodePool applies to the nodes it provisions. Without it, the chart's default installs Kata's containerd drop-in on **every** node in the cluster, including nodes that have nothing to do with this blueprint.
+- The NodePool provisions each node with a **startup taint** of the same key, which keeps workloads off the node until Kata is actually installed. This closes a race: without it, a pod requesting a Kata RuntimeClass can be scheduled onto a fresh node before the runtime binaries exist, and it fails to start until the install catches up.
+- `tolerations` lets the kata-deploy pod itself land on the tainted node, and `startupTaints` tells kata-deploy to remove the taint as its final install step, at which point the scheduler admits the waiting workloads.
 
 This creates:
 
-- A `kata-deploy` `DaemonSet` that runs on each node and installs the Kata binaries + a drop-in containerd config
+- A `kata-deploy` `DaemonSet`, scoped to nested-virt nodes, that installs the Kata binaries + a drop-in containerd config
 - A set of `RuntimeClass` resources: `kata-qemu-runtime-rs`, `kata-fc`, `kata-clh`, and TDX/SNP/confidential variants
 
-You won't see the DaemonSet pod land on nested-virt nodes yet — none exist. It picks them up automatically once Karpenter provisions them below.
+You won't see the DaemonSet pod land on nested-virt nodes yet, none exist. It picks them up automatically once Karpenter provisions them below.
 
 ### 3. The two verification workloads
 
-Now that the NodePool and the Kata runtime are both in place, we need to check the two layers actually work end-to-end. This section deploys two small pods — one that inspects the underlying node for the nested-virt substrate (Karpenter side), and one that boots inside a Kata MicroVM (Kata side) — so you can see each layer doing its job.
+Now that the NodePool and the Kata runtime are both in place, we need to check the two layers actually work end-to-end. This section deploys two small pods, one that inspects the underlying node for the nested-virt substrate (Karpenter side), and one that boots inside a Kata MicroVM (Kata side), so you can see each layer doing its job.
 
-**Host-level check** — a privileged pod that inspects `/dev/kvm` on the underlying node. This is Karpenter-plumbing-only; it doesn't need Kata.
+**Host-level check**: a privileged pod that inspects `/dev/kvm` on the underlying node. This checks the Karpenter plumbing only. It doesn't need Kata.
 
 ```sh
 kubectl apply -f workload.yaml
 ```
 
-Karpenter provisions a nested-virt-capable instance (typically `c8i.large` under the requirements shipped here). Once the pod is Running, check the logs:
+Karpenter provisions the cheapest nested-virt-capable instance that fits (`c7i-flex.large` is a common pick under the requirements shipped here). Once the pod is Running, check the logs:
 
 ```sh
 kubectl logs deploy/nested-virt-demo
@@ -111,7 +128,7 @@ crw-rw-rw-. 1 root 36 10, 232 Jul 22 20:08 /dev/kvm
 PASS: nested virtualization is accessible from this pod.
 ```
 
-**MicroVM check** — a pod that runs *inside* a Kata MicroVM via the `kata-qemu-runtime-rs` RuntimeClass. This proves Kata is functional on the node, not just that the CPU flag is there.
+**MicroVM check**: a pod that runs *inside* a Kata MicroVM via the `kata-qemu-runtime-rs` RuntimeClass. This proves Kata is functional on the node, not just that the CPU flag is there.
 
 ```sh
 kubectl apply -f sandbox-workload.yaml
@@ -135,7 +152,7 @@ The interesting line is the kernel version: the guest reports `6.18.35` where th
 
 `sandbox.yaml` deploys a tiny HTTP service (Python's stdlib `http.server` for zero image bloat) that accepts `POST /exec {"code": "..."}` and returns the stdout / stderr / exit code of running that Python code. **The service runs inside a Kata MicroVM** (`runtimeClassName: kata-qemu-runtime-rs`), so any code you `POST` to it executes in its own kernel and filesystem.
 
-> ⚠️ **Do not expose this sandbox to the public internet.** The `Service` in `sandbox.yaml` is `ClusterIP` (in-cluster only) and there is no authentication on `POST /exec` — it will run whatever Python you give it. That's fine for a blueprint demo, but for real use put an authenticating proxy in front, keep it internal, or wrap the exec API in your agent framework's tool-call auth layer.
+> ⚠️ **Do not expose this sandbox to the public internet.** The `Service` in `sandbox.yaml` is `ClusterIP` (in-cluster only) and there is no authentication on `POST /exec`, it will run whatever Python you give it. That's fine for a blueprint demo, but for real use put an authenticating proxy in front, keep it internal, or wrap the exec API in your agent framework's tool-call auth layer.
 
 Deploy it:
 
@@ -168,7 +185,7 @@ Sample response:
 Two things worth noting:
 
 1. **`kernel: 6.18.35`** in the response payload is what the exec'd Python sees. The host node is AL2023 with a 6.12.x kernel. Different kernels = different VMs. Different VMs = hard isolation.
-2. **`rm -rf /tmp/x`** succeeded (rc=0) inside the MicroVM. The host node's `/tmp` is untouched. Try a genuinely destructive pattern and it still won't reach the host — the MicroVM filesystem is ephemeral to the pod.
+2. **`rm -rf /tmp/x`** succeeded (rc=0) inside the MicroVM. The host node's `/tmp` is untouched. Try a genuinely destructive pattern and it still won't reach the host. The MicroVM filesystem is ephemeral to the pod.
 
 Every replica of the `sandbox` Deployment gets its own MicroVM, so scaling replicas gives you a per-tool-call isolation model out of the box.
 
@@ -178,9 +195,9 @@ A few directions to take the blueprint further, from swapping the underlying VMM
 
 - **Firecracker VMM.** The upstream Helm chart wires `kata-fc` to the `devmapper` snapshotter for a small-image-fast-boot pattern (Firecracker's sweet spot: ~125 ms boot, ~5 MB VMM overhead). AL2023 doesn't have a devmapper thin-pool by default, so `kata-fc` fails to launch pods out of the box. To use it: prepare a devmapper thin-pool on the node (typically via a node bootstrap script or a Bottlerocket variant) and register it with containerd. See the [Kata devmapper snapshotter guide](https://github.com/kata-containers/kata-containers/blob/main/docs/how-to/how-to-use-virtio-fs-with-nydus.md) for the setup.
 - **Bottlerocket Kata variant.** Bottlerocket ships a `kata`-flavored variant with Kata pre-installed on the AMI, so you skip the DaemonSet install step entirely. Point the `EC2NodeClass.amiSelectorTerms` at the variant's SSM parameter and drop `kata-deploy`.
-- **KubeVirt for legacy VMs.** KubeVirt uses the same nested-virt substrate to run full traditional VMs (Windows, unusual kernels, HPC images) as pods. The same NodePool works — swap the sample workload for a `VirtualMachineInstance` CR.
+- **KubeVirt for legacy VMs.** KubeVirt uses the same nested-virt substrate to run full traditional VMs (Windows, unusual kernels, HPC images) as pods. The same NodePool works, just swap the sample workload for a `VirtualMachineInstance` CR.
 - **Confidential Containers.** The chart also creates `kata-qemu-snp` and `kata-qemu-tdx` RuntimeClasses. On instance families that expose SEV-SNP or Intel TDX, these give you attested-encrypted memory on top of the MicroVM boundary. Not applicable on the families this NodePool selects today, but useful to know it's the same install path.
-- **Negative case.** If you edit the NodePool requirements to include a family without nested-virt support (e.g. `m6i`), Karpenter's `NestedVirtualizationFilter` rejects it and the pod stays `Pending`. Check `kubectl get events --field-selector reason=FailedScheduling` — the message will tell you no suitable instance type could be found.
+- **Negative case.** If you edit the NodePool requirements to include a family without nested-virt support (e.g. `m6i`), Karpenter's `NestedVirtualizationFilter` rejects it and the pod stays `Pending`. Check `kubectl get events --field-selector reason=FailedScheduling`. The message will tell you no suitable instance type could be found.
 
 ## Cleanup
 
