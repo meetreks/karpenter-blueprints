@@ -129,7 +129,18 @@ module "vpc" {
   private_subnet_tags = {
     "kubernetes.io/cluster/${local.name}" = "shared"
     "kubernetes.io/role/internal-elb"     = 1
+    # Discovery tag used by NodeClass subnetSelectorTerms in the blueprints
+    "karpenter.sh/discovery" = local.name
   }
 
   tags = local.tags
+}
+
+# Tag the EKS-managed primary cluster security group so NodeClass
+# securityGroupSelectorTerms can discover it by tag, same convention as the
+# OSS cluster template.
+resource "aws_ec2_tag" "cluster_primary_security_group" {
+  resource_id = module.eks.cluster_primary_security_group_id
+  key         = "karpenter.sh/discovery"
+  value       = local.name
 }

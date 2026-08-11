@@ -42,3 +42,8 @@ output "auto_mode_node_role_arn" {
   description = "ARN of the IAM role used by EKS Auto Mode nodes (referenced by the per-blueprint README access-entry instructions)"
   value       = aws_iam_role.auto_mode_node.arn
 }
+
+output "node_role_name" {
+  description = "Name of the IAM role used by EKS Auto Mode nodes (substitute into NodeClass spec.role)"
+  value       = aws_iam_role.auto_mode_node.name
+}

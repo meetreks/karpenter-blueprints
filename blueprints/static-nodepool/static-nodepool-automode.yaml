@@ -21,9 +21,13 @@ spec:
         - key: karpenter.sh/capacity-type
           operator: In
           values: ["on-demand"]
+        # All EFA-capable GPU types. A list (rather than a single pin) keeps
+        # the pool usable across regions: g6e is not available in every
+        # region, and single-type pools stall on InsufficientCapacityError
+        # when that one type has no on-demand capacity.
         - key: node.kubernetes.io/instance-type
           operator: In
-          values: ["g6e.8xlarge"]
+          values: ["g6e.8xlarge", "g5.8xlarge", "g5.12xlarge", "g4dn.8xlarge", "g4dn.12xlarge"]
       taints:
         - key: nvidia.com/gpu
           effect: NoSchedule

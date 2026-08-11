@@ -230,7 +230,14 @@ EKS Auto Mode supports static capacity NodePools with the same `spec.replicas` f
 
 As of the [July 2026 EFA and Placement Groups launch](https://aws.amazon.com/about-aws/whats-new/2026/07/amazon-eks-efa-placement-groups/), the Auto Mode `NodeClass` also exposes EFA network interfaces and placement-group configuration as first-class fields. The shipped `static-nodeclass-automode.yaml` sets a primary `interface` ENI plus a secondary `efa-only` ENI under `spec.advancedNetworking.networkInterfaces`, and the paired `static-nodepool-automode.yaml` carries the `vpc.amazonaws.com/efa.present: "true"` label so pods that request EFA can schedule onto it. NVIDIA drivers and the device plugin are still bundled by Auto Mode, so no extra install is needed.
 
-To deploy on Auto Mode, substitute the placeholders and apply:
+To deploy on Auto Mode, set the variables from the Auto Mode Terraform template (not the OSS `cluster/terraform` one used earlier in this README):
+
+```sh
+export CLUSTER_NAME=$(terraform -chdir="../../cluster/automode" output -raw cluster_name)
+export KARPENTER_NODE_IAM_ROLE_NAME=$(terraform -chdir="../../cluster/automode" output -raw node_role_name)
+```
+
+Then substitute the placeholders and apply:
 
 ```sh
 sed -i \
@@ -240,6 +247,35 @@ sed -i \
 kubectl apply -f static-nodeclass-automode.yaml
 kubectl apply -f static-nodepool-automode.yaml
 ```
+
+Once the node registers, verify EFA end to end. The node should carry the EFA label and expose the EFA device as an allocatable resource:
+
+```sh
+kubectl get nodes -l capacity-type=gpu-static \
+  -o custom-columns="NODE:.metadata.name,EFA_LABEL:.metadata.labels.vpc\.amazonaws\.com/efa\.present,EFA_ALLOCATABLE:.status.allocatable.vpc\.amazonaws\.com/efa"
+```
+
+And the instance should have both ENIs attached, with the `efa-only` interface carrying no IP address. If you configured a `placementGroupSelector` on the NodeClass, `Placement.GroupName` confirms the instance landed in it:
+
+```sh
+INSTANCE_ID=$(kubectl get nodes -l capacity-type=gpu-static -o jsonpath='{.items[0].metadata.name}')
+aws ec2 describe-instances --instance-ids $INSTANCE_ID \
+  --query 'Reservations[0].Instances[0].{PlacementGroup:Placement.GroupName,ENIs:NetworkInterfaces[*].{DeviceIndex:Attachment.DeviceIndex,Type:InterfaceType,PrivateIp:PrivateIpAddress}}'
+```
+
+Expected output:
+
+```json
+{
+    "PlacementGroup": "my-placement-group",
+    "ENIs": [
+        { "DeviceIndex": 1, "Type": "efa-only",  "PrivateIp": null },
+        { "DeviceIndex": 0, "Type": "interface", "PrivateIp": "10.0.x.x" }
+    ]
+}
+```
+
+`PlacementGroup` is an empty string when the NodeClass doesn't set a `placementGroupSelector`.
 
 Key differences from the OSS version:
 - `NodeClass` (`eks.amazonaws.com/v1`) replaces `EC2NodeClass` (`karpenter.k8s.aws/v1`)
